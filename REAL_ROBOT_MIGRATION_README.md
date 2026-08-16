@@ -268,3 +268,76 @@ ros2 launch control_node full_competition.launch.py \
   platform:=real \
   rgb_topic:=/some/other/rgb/topic
 ```
+
+
+## 真机日常操作速查
+
+原 `使用文档.md` 已删除（它的解压安装流程和“`start_stage` 不能只跑一个赛段”
+的说法都已经不成立），其中仍然有效的部分并入本节。接口层的原理见上面第 1、
+2、7 节，话题清单见“Physical camera topics”。
+
+### 编译与环境
+
+机器狗上的 ROS 2 装在 `/opt/ros2/`，与仿真容器的 `/opt/ros/` 不是一个路径：
+
+```bash
+source /opt/ros2/galactic/setup.bash
+source /opt/ros2/cyberdog/setup.bash
+
+cd ~/cyberdog_ws
+colcon build --packages-select control_node --symlink-install
+source install/setup.bash
+```
+
+每次新开终端都要重新 source 这三个 setup.bash。
+
+### 运行
+
+完整比赛（先 RecoveryStand(111) 起立，再 Stage1 → … → Stage6）：
+
+```bash
+ros2 launch control_node full_competition.launch.py platform:=real start_stage:=1
+```
+
+`start_stage:=N` 是“从第 N 赛段开始并继续跑完后面的赛段”；只跑一个赛段要配合
+`single_stage:=true`（见第 7 节）。起立可以用 `startup_recovery_enabled:=false` 关掉。
+
+### 启动前自检相机
+
+```bash
+ros2 topic hz /mi_desktop_48_b0_2d_7b_00_e2/image_rgb
+ros2 topic hz /mi_desktop_48_b0_2d_7b_00_e2/camera/depth/image_rect_raw
+```
+
+### 关键日志
+
+连续运动正常接管时，`[REAL_CTRL]` 会依次打印这三条：
+
+```text
+[REAL_CTRL] SERVO_START motion_id=303 ...
+[REAL_CTRL] SERVO_READY motion_id=303 robot_ack=True ...
+[REAL_CTRL] FIRST SERVO_DATA motion_id=303
+```
+
+走不完就说明 303 还没真正进入控制，常见两种失败：
+
+```text
+[REAL_CTRL] SERVO_START ACK timeout motion_id=... after ...s
+[REAL_CTRL] SERVO_START rejected/busy motion_id=...
+```
+
+相机断流的两条信号：
+
+```text
+[P4_RGB_STALE_STOP] ... dedicated RGB age=... >= 0.800s ...; cmd=(0,0,0)
+[<状态名>] rgb stream stale: age=... > 2.00s, enter P5_SENSOR_FAULT_HOLD
+```
+
+Stage4 会把命令压成零速并尝试重建 RGB 接收线程（`p4_rgb_stale_stop_s`）；
+Stage5 直接进 `P5_SENSOR_FAULT_HOLD` 停住等人工恢复
+（`p5_sensor_max_frame_age_s`）。两者都优先查机器狗 RGB 相机。
+
+### 停止
+
+`Ctrl+C`。赛段节点在退出路径上先发 STOP——真机上就是 `SERVO_END`——
+然后 `Ctrl.quit()` 再补一次 `SERVO_END`。
