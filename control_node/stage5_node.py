@@ -63,6 +63,7 @@ from control_node.route_model import (
     verify_yaw,
 )
 from control_node.stage_common import StageNodeBase
+from control_node.stage_entry import EntryPoint, StageEntryTable
 
 
 #: 开局站姿相对声明航向偏出这么多就值得报警：转角容差是 6 度，比它还大的
@@ -491,10 +492,93 @@ class Stage5Node(StageNodeBase):
         )
 
     # ============================================================
+    # 调试入口
+    # ============================================================
+    @classmethod
+    def p5_entry_table(cls) -> StageEntryTable:
+        """第五赛段调试入口表（顺序即绕环一圈的顺序）。
+
+        入口名和 route_model.default_segments() 的段名对齐（ramp = up_slope，
+        straight_1/2/3、corner_1..4），这样跑到一半的证据日志和调试入口用的是
+        同一套词。route_model 通过状态名反查段，所以从中段进入不会破坏段模型：
+        它会直接从对应段开始积分。
+
+        但**里程只能给出沿路线的进度，给不出相对桥面中线的偏移**。从中段进入
+        时机器人必须已经被摆在该段的起点、朝向该段方向，否则整段都会带着一个
+        固定的横向误差走完。
+        """
+        states = (
+            cls.P5_RECOVERY_STAND,
+            cls.P5_SET_BODY_NORMAL,
+            cls.P5_START_ALIGN,
+            cls.P5_STEP_UP,
+            cls.P5_UP_SLOPE,
+            cls.P5_AFTER_UP_SLOPE_FORWARD,
+            cls.P5_AFTER_UP_SLOPE_VELOCITY_CONTROL,
+            cls.P5_SET_RIGHT_SLOPE_BODY,
+            cls.P5_RIGHT_SLOPE_1,
+            cls.P5_RIGHT_SLOPE_1_FORWARD_AFTER_CENTER_LOST,
+            cls.P5_TURN_1,
+            cls.P5_RECOVERY_AFTER_TURN_1,
+            cls.P5_RIGHT_SLOPE_2,
+            cls.P5_RIGHT_SLOPE_2_FORWARD_AFTER_CENTER_LOST,
+            cls.P5_TURN_2,
+            cls.P5_RECOVERY_AFTER_TURN_2,
+            cls.P5_RIGHT_SLOPE_3,
+            cls.P5_RIGHT_SLOPE_3_FORWARD_AFTER_CENTER_LOST,
+            cls.P5_RESET_BODY,
+            cls.P5_RIGHT_SHIFT_BEFORE_RIGHT_JUMP,
+            cls.P5_RIGHT_SHIFT_BEFORE_RIGHT_JUMP_2,
+            cls.P5_RIGHT_JUMP_AFTER_RESET_BODY,
+            cls.P5_ALIGN_AFTER_RIGHT_JUMP,
+            cls.P5_FORWARD_AFTER_RESET_BODY,
+            cls.P5_FORWARD_NO_ALIGN_AFTER_RESET_BODY,
+            cls.P5_JUMP_EXIT_SLOPE,
+            cls.P5_RECOVERY_AFTER_JUMP_2,
+            cls.P5_FINAL_LONG_JUMP,
+            cls.P5_DONE,
+        )
+        placed = '机器人必须已经被摆在该段起点并朝向该段方向'
+        return StageEntryTable(cls.STAGE_ID, cls.P5_SET_BODY_NORMAL, states, (
+            EntryPoint('start', cls.P5_SET_BODY_NORMAL,
+                       '设置机身姿态，完整第五赛段'),
+            EntryPoint('recovery', cls.P5_RECOVERY_STAND, '先恢复站立再走完整流程'),
+            EntryPoint('align', cls.P5_START_ALIGN, '上桥前对齐声明的赛道方向'),
+            EntryPoint('step_up', cls.P5_STEP_UP, '上台阶（route 段 entry_step_up）',
+                       requires=(placed,)),
+            EntryPoint('ramp', cls.P5_UP_SLOPE, '上坡段（route 段 up_slope）',
+                       requires=(placed, '已经站在坡道上')),
+            EntryPoint('ramp_exit', cls.P5_AFTER_UP_SLOPE_FORWARD,
+                       '上坡结束后的定时前进', requires=(placed,)),
+            EntryPoint('corner_1', cls.P5_AFTER_UP_SLOPE_VELOCITY_CONTROL,
+                       '第一个转角', requires=(placed,)),
+            EntryPoint('slope_body', cls.P5_SET_RIGHT_SLOPE_BODY, '设置侧坡机身姿态'),
+            EntryPoint('straight_1', cls.P5_RIGHT_SLOPE_1, '直道 1（route 段 straight_1）',
+                       requires=(placed,)),
+            EntryPoint('corner_2', cls.P5_TURN_1, '第二个转角', requires=(placed,)),
+            EntryPoint('straight_2', cls.P5_RIGHT_SLOPE_2, '直道 2（route 段 straight_2）',
+                       requires=(placed,)),
+            EntryPoint('corner_3', cls.P5_TURN_2, '第三个转角', requires=(placed,)),
+            EntryPoint('straight_3', cls.P5_RIGHT_SLOPE_3, '直道 3（route 段 straight_3）',
+                       requires=(placed,)),
+            EntryPoint('reset_body', cls.P5_RESET_BODY, '直道 3 结束后恢复机身姿态'),
+            EntryPoint('corner_4', cls.P5_RIGHT_JUMP_AFTER_RESET_BODY,
+                       '第四个转角（转向跳）', requires=(placed,)),
+            EntryPoint('descent', cls.P5_FORWARD_AFTER_RESET_BODY,
+                       '下坡直道（route 段 right_descent）', requires=(placed,)),
+            EntryPoint('final', cls.P5_JUMP_EXIT_SLOPE,
+                       '收尾区：跳下坡道（route 段 final_zone）', requires=(placed,)),
+            EntryPoint('final_jump', cls.P5_FINAL_LONG_JUMP, '收尾远跳',
+                       requires=(placed,)),
+        ))
+
+    # ============================================================
     # 参数声明
     # ============================================================
     def p5_declare_params(self):
-        self.declare_parameter('p5_initial_state', self.P5_SET_BODY_NORMAL)
+        # 调试入口：可写具名入口（ramp、straight_2、final_jump …）或直接写
+        # 状态名。统一的 entry_point 参数（launch 里的 stage5_entry）优先。
+        self.declare_parameter('p5_initial_state', 'default')
         self.declare_parameter('p5_control_period_s', 0.02)
 
         # RGB / 可视化
@@ -1093,7 +1177,8 @@ class Stage5Node(StageNodeBase):
     def p5_load_params(self):
         gp = self.get_parameter
 
-        self.p5_initial_state = str(gp('p5_initial_state').value)
+        self.p5_initial_state = self.resolve_stage_entry(
+            self.p5_entry_table(), str(gp('p5_initial_state').value))
         self.control_period_s = float(gp('p5_control_period_s').value)
 
         self.p5_show_debug_vis = bool(gp('p5_show_debug_vis').value)

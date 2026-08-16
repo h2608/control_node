@@ -18,6 +18,55 @@ from sensor_msgs.msg import Image
 
 from control_node.robot_control_cmd_lcmt import robot_control_cmd_lcmt
 from control_node.stage_common import StageNodeBase
+from control_node.stage_entry import EntryPoint, StageEntryTable
+
+
+def p6_entry_table(start_state='BLIND_MARCH'):
+    """第六赛段调试入口表（顺序即流程顺序）。
+
+    start_state 由 p6_north_align_test_only 决定：该调试模式的正常起点是
+    NORTHWARD_MARCH 而不是 BLIND_MARCH。
+    """
+    states = (
+        'P6_START',
+        'BLIND_MARCH',
+        'NORTHWARD_MARCH',
+        'FINAL_ALIGN',
+        'OPEN_LOOP_TURN',
+        'SHRINK_LEGS',
+        'EASTWARD_MARCH',
+        'CLEAR_BALL_TURN',
+        'BUFFER_CRAB',
+        'LOWER_BODY_FOR_CRAB',
+        'CLEAR_BALL_CRAB',
+        'RESTORE_POSTURE',
+        'TURN_TO_WEST_WALL',
+        'WESTWARD_VISUAL_MARCH',
+        'ALIGN_WEST_WALL',
+        'TURN_TO_EXIT',
+        'LOWER_BODY_FINAL',
+        'PUSH_TO_EXIT',
+        'CROSS_FINISH_LINE',
+        'MISSION_COMPLETE',
+        'P6_TEST_HOLD',
+    )
+    wall = '对应的墙面必须在前向视野内'
+    return StageEntryTable(6, start_state, states, (
+        EntryPoint('start', 'BLIND_MARCH', '起步盲走，完整第六赛段'),
+        EntryPoint('north', 'NORTHWARD_MARCH', '北进贴墙', requires=(wall,)),
+        EntryPoint('north_align', 'FINAL_ALIGN', '对北墙校准', requires=(wall,)),
+        EntryPoint('turn', 'OPEN_LOOP_TURN', '开环右转 90°'),
+        EntryPoint('east', 'EASTWARD_MARCH', '东进潜入，绕过球'),
+        EntryPoint('clear_ball', 'CLEAR_BALL_TURN', '解围：自转兜球'),
+        EntryPoint('crab', 'CLEAR_BALL_CRAB', '解围：右横移推球'),
+        EntryPoint('west', 'TURN_TO_WEST_WALL', '转向西墙'),
+        EntryPoint('west_march', 'WESTWARD_VISUAL_MARCH', '视觉靠近西墙',
+                   requires=(wall,)),
+        EntryPoint('west_align', 'ALIGN_WEST_WALL', '对西墙校准', requires=(wall,)),
+        EntryPoint('exit', 'TURN_TO_EXIT', '转向出口'),
+        EntryPoint('push', 'PUSH_TO_EXIT', '推向出口'),
+        EntryPoint('finish', 'CROSS_FINISH_LINE', '冲过终点线'),
+    ))
 
 
 class Stage6Node(StageNodeBase):
@@ -33,6 +82,9 @@ class Stage6Node(StageNodeBase):
         # 真机分步调试：只执行“北向接近黄线 -> 原地校准 -> 保持停车”。
         # 默认关闭，避免改变正式比赛状态机；由专用参数文件显式开启。
         self.declare_parameter('p6_north_align_test_only', False)
+        # 调试入口：可写具名入口（north、east、west_march …）或直接写状态名。
+        # 统一的 entry_point 参数（launch 里的 stage6_entry）优先于这一个。
+        self.declare_parameter('p6_initial_state', 'default')
         self.declare_parameter('p6_north_test_vx', 0.10)
         self.declare_parameter('p6_north_test_stop_dist_m', 0.80)
         self.declare_parameter('p6_north_test_align_tolerance_deg', 4.0)
@@ -180,18 +232,13 @@ class Stage6Node(StageNodeBase):
 
         # 第六赛段状态集合与调试入口。注意：这些必须在 sixth_stage_init() 里执行，
         # 不能放到 now_sec() 的 return 后面，否则 P6 状态分发和直接调试入口会失效。
-        self.p6_states = {
-            'P6_START',
-            'BLIND_MARCH', 'NORTHWARD_MARCH', 'FINAL_ALIGN', 'OPEN_LOOP_TURN',
-            'SHRINK_LEGS', 'EASTWARD_MARCH', 'CLEAR_BALL_TURN', 'BUFFER_CRAB',
-            'LOWER_BODY_FOR_CRAB', 'CLEAR_BALL_CRAB', 'RESTORE_POSTURE',
-            'TURN_TO_WEST_WALL', 'WESTWARD_VISUAL_MARCH', 'ALIGN_WEST_WALL',
-            'TURN_TO_EXIT', 'LOWER_BODY_FINAL', 'PUSH_TO_EXIT',
-            'CROSS_FINISH_LINE', 'MISSION_COMPLETE', 'P6_TEST_HOLD',
-        }
-        self.p6_initial_state = (
+        # 状态集合取自入口表，两处不会各自漂移。
+        entry_table = p6_entry_table(
             'NORTHWARD_MARCH'
             if self.p6_north_align_test_only else 'BLIND_MARCH')
+        self.p6_states = set(entry_table.state_names())
+        self.p6_initial_state = self.resolve_stage_entry(
+            entry_table, str(self.get_parameter('p6_initial_state').value))
         self.p6_control_period_s = 0.10
         self.p6_last_control_time = None
         self.p6_state_start_time = self.now_sec()

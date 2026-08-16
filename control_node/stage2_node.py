@@ -20,6 +20,87 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 
 from control_node.stage_common import StageNodeBase, clamp
+from control_node.stage_entry import (
+    EntryPoint,
+    StageEntryTable,
+    is_default_request,
+)
+
+
+# 撞球子链：这些状态打完球后回到 ball_return_state，直接从它们启动时必须
+# 用 p2_ball_return_state 指定回哪条巡航，否则会回到自己形成死循环。
+P2_BALL_SUBCHAIN_STATES = (
+    'BALL_LATERAL_ALIGN',
+    'BALL_HIT_CONFIRM_FORWARD',
+    'BALL_POST_HIT_SIDE_SHIFT',
+)
+
+P2_CRUISE_STATES = (
+    'STAGE1_CRUISE_BALL_AND_YELLOW',
+    'STAGE2_CRUISE_YELLOW_ONLY',
+    'STAGE3_CRUISE_BALL_ONLY',
+)
+
+
+def p2_entry_table():
+    """第二赛段调试入口表。
+
+    内部状态名里的 STAGE1_/STAGE2_/STAGE3_ 是第二赛段自己的三条巡航赛道，
+    不是比赛第一/二/三赛段；入口名用 track1/track2/track3 消歧。
+    """
+    states = (
+        # 赛道 1
+        'STAGE1_CRUISE_BALL_AND_YELLOW',
+        'STAGE1_FORWARD_BEFORE_ROTATE',
+        'STAGE1_ROTATE_LEFT_90',
+        'STAGE1_MOVE_RIGHT_FIXED_DISTANCE',
+        # 赛道 2
+        'STAGE2_CRUISE_YELLOW_ONLY',
+        'STAGE2_ROTATE_LEFT_90',
+        'STAGE2_MOVE_FORWARD_AFTER_LEFT_JUMP',
+        'STAGE2_MOVE_FORWARD_AFTER_LEFT_JUMP_TIME',
+        # 赛道 3
+        'STAGE3_CRUISE_BALL_ONLY',
+        'STAGE3_FINAL_DECISION',
+        'STAGE3_GO_SCAN',
+        'STAGE3_SCAN_AND_HIT_LAST',
+        'STAGE3_ROTATE_BACK_180',
+        'STAGE3_GO_FINAL',
+        'STAGE3_FORWARD_AFTER_GO_FINAL',
+        'STAGE3_ROTATE_LEFT_30',
+        'STAGE3_FINAL_ROTATE_AFTER_LEFT_SHIFT',
+        # 撞球子链
+    ) + P2_BALL_SUBCHAIN_STATES + ('DONE',)
+    ball_note = 'ball_return_state 必须用 p2_ball_return_state 指定'
+    return StageEntryTable(2, 'STAGE1_CRUISE_BALL_AND_YELLOW', states, (
+        EntryPoint('start', 'STAGE1_CRUISE_BALL_AND_YELLOW',
+                   '赛道 1 巡航（橙球 + 黄线），完整第二赛段'),
+        EntryPoint('track1', 'STAGE1_CRUISE_BALL_AND_YELLOW', '赛道 1 巡航'),
+        EntryPoint('track1_exit', 'STAGE1_FORWARD_BEFORE_ROTATE',
+                   '赛道 1 结束，转向前的定时前进'),
+        EntryPoint('track1_turn', 'STAGE1_ROTATE_LEFT_90', '赛道 1 -> 2 左转 90°'),
+        EntryPoint('track1_shift', 'STAGE1_MOVE_RIGHT_FIXED_DISTANCE',
+                   '转向后的定距右横移'),
+        EntryPoint('track2', 'STAGE2_CRUISE_YELLOW_ONLY', '赛道 2 巡航（只看黄线）'),
+        EntryPoint('track2_turn', 'STAGE2_ROTATE_LEFT_90', '赛道 2 -> 3 左转 90°'),
+        EntryPoint('track2_forward', 'STAGE2_MOVE_FORWARD_AFTER_LEFT_JUMP',
+                   '赛道 2 转向后的前进'),
+        EntryPoint('track3', 'STAGE3_CRUISE_BALL_ONLY', '赛道 3 巡航（只看橙球）'),
+        EntryPoint('scan', 'STAGE3_GO_SCAN', '赛道 3 末端补扫最后一个球'),
+        EntryPoint('scan_hit', 'STAGE3_SCAN_AND_HIT_LAST', '补扫命中最后一个球'),
+        EntryPoint('turn_back', 'STAGE3_ROTATE_BACK_180', '补扫后掉头 180°'),
+        EntryPoint('final', 'STAGE3_GO_FINAL', '走向出口'),
+        EntryPoint('final_forward', 'STAGE3_FORWARD_AFTER_GO_FINAL', '出口前定时前进'),
+        EntryPoint('final_turn', 'STAGE3_ROTATE_LEFT_30', '出口前左转 30°'),
+        EntryPoint('final_align', 'STAGE3_FINAL_ROTATE_AFTER_LEFT_SHIFT',
+                   '收尾转向，之后上报完成'),
+        EntryPoint('ball_align', 'BALL_LATERAL_ALIGN', '撞球子链：横向对准球',
+                   requires=(ball_note, '橙球必须在鱼眼视野内')),
+        EntryPoint('ball_hit', 'BALL_HIT_CONFIRM_FORWARD', '撞球子链：撞击确认前进',
+                   requires=(ball_note,)),
+        EntryPoint('ball_shift', 'BALL_POST_HIT_SIDE_SHIFT', '撞球子链：撞后侧移',
+                   requires=(ball_note,)),
+    ))
 
 
 class Stage2Node(StageNodeBase):
@@ -29,7 +110,11 @@ class Stage2Node(StageNodeBase):
     def __init__(self):
         super().__init__('stage2_node', self.STAGE_ID)
 
-        self.declare_parameter('second_stage_initial_state', 'STAGE1_CRUISE_BALL_AND_YELLOW')
+        # 调试入口：可写入口名（track2、scan、final…）或直接写状态名。
+        # 统一的 entry_point 参数（launch 里的 stage2_entry）优先于这一个。
+        self.declare_parameter('second_stage_initial_state', 'default')
+        # 从撞球子链入口启动时，指定打完球回到哪条巡航赛道。
+        self.declare_parameter('p2_ball_return_state', 'default')
 
         # =========================
         # 状态机状态说明
@@ -368,7 +453,11 @@ class Stage2Node(StageNodeBase):
         self.declare_parameter('stage1_before_turn_forward_vx', 0.20)
         self.declare_parameter('stage1_before_turn_forward_duration_s', 1.0)
 
-        self.second_stage_initial_state = self.get_parameter('second_stage_initial_state').value
+        self.p2_entry_table = p2_entry_table()
+        self.second_stage_initial_state = self.resolve_stage_entry(
+            self.p2_entry_table,
+            str(self.get_parameter('second_stage_initial_state').value))
+        self.p2_ball_return_state = self.resolve_p2_ball_return_state()
 
         self.orange_h_min = int(self.get_parameter('orange_h_min').value)
         self.orange_h_max = int(self.get_parameter('orange_h_max').value)
@@ -616,7 +705,7 @@ class Stage2Node(StageNodeBase):
         # self.state 由 StageNodeBase 管理；赛段入口状态在 on_activated() 里设置。
         # 整合后 initial_state 是 P1_STAND_WAIT；撞球子链回退状态必须默认指向第二赛段入口，
         # 避免异常路径下撞球结束后跳回第一赛段。
-        self.ball_return_state = self.second_stage_initial_state
+        self.ball_return_state = self.p2_ball_return_state
 
         self.yellow_stop_counter = 0
 
@@ -775,6 +864,38 @@ class Stage2Node(StageNodeBase):
             self.get_logger().warning('[RECOVERY] recovery stand failed or timed out')
         return finished
 
+    def resolve_p2_ball_return_state(self) -> str:
+        """撞球子链打完球后回到的巡航状态。
+
+        正常情况就是本次的入口状态。但从撞球子链本身启动调试时，那会让子链
+        回到自己形成死循环，所以要么用 ``p2_ball_return_state`` 指定一条巡航
+        赛道，要么退回赛道 1 并明确告警。
+        """
+        requested = str(self.get_parameter('p2_ball_return_state').value)
+        if not is_default_request(requested):
+            resolution = self.p2_entry_table.resolve(requested)
+            if not resolution.ok:
+                self.get_logger().error(
+                    '[ENTRY] p2_ball_return_state: ' + resolution.message)
+            elif resolution.state in P2_BALL_SUBCHAIN_STATES:
+                self.get_logger().error(
+                    f'[ENTRY] p2_ball_return_state={resolution.state} is itself a '
+                    'ball sub-chain state; ignoring it')
+            else:
+                self.get_logger().warn(
+                    f'[ENTRY] ball sub-chain returns to {resolution.state}')
+                return resolution.state
+
+        entry = self.second_stage_initial_state
+        if entry in P2_BALL_SUBCHAIN_STATES:
+            fallback = P2_CRUISE_STATES[0]
+            self.get_logger().warn(
+                f'[ENTRY] stage 2 starts inside the ball sub-chain ({entry}) '
+                'without p2_ball_return_state; the sub-chain will return to '
+                f'{fallback}')
+            return fallback
+        return entry
+
     def on_activated(self):
         # Full mission startup already performs the single RecoveryStand(111).
         # Do not inject another preset action merely because Stage2 becomes active.
@@ -795,7 +916,7 @@ class Stage2Node(StageNodeBase):
         self.post_hit_side_shift_start_time_sec = None
         self.last_hit_side = None
         self.side_shift_done = False
-        self.ball_return_state = self.second_stage_initial_state
+        self.ball_return_state = self.p2_ball_return_state
 
         self.stage2_forward_after_left_jump_start_time_sec = None
         self.stage3_final_left_shift_start_time_sec = None

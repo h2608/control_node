@@ -155,6 +155,57 @@ ros2 launch control_node full_competition.launch.py \
 不会继续启动后续赛段。省略 `single_stage:=true` 时保持原行为：从
 `start_stage` 开始并继续运行后面的赛段。
 
+### 赛段内部调试入口（stageN_entry）
+
+`start_stage` 只能选到赛段级；要只跑赛段里的某一段，再加 `stageN_entry`。
+例如只跑第五赛段的坡道段：
+
+```bash
+ros2 launch control_node full_competition.launch.py \
+  single_stage:=true \
+  start_stage:=5 \
+  stage5_entry:=ramp
+```
+
+六个赛段各有一张入口表（`control_node/stage_entry.py` + 各赛段的
+`pN_entry_table()`）。入口名一律小写，也可以直接写内部状态名：
+
+| 赛段 | 入口名 |
+| --- | --- |
+| 1 | `start` `cruise` `brake` `align` `restore` `forward` `turn` `ball` `shift` |
+| 2 | `start` `track1` `track1_exit` `track1_turn` `track1_shift` `track2` `track2_turn` `track2_forward` `track3` `scan` `scan_hit` `turn_back` `final` `final_forward` `final_turn` `final_align` `ball_align` `ball_hit` `ball_shift` |
+| 3 | `start` `s_curve` `align` |
+| 4 | `start` `search` `bar_center` `bar` `bar_target` `bar_hit` `bar_back` `bar_yellow` `obstacle_center` `obstacle` `obstacle_route` `target` `target_hit` `upright` `post_hit` `post_hit_obstacle` `final` `final_yellow` `final_align` |
+| 5 | `start` `recovery` `align` `step_up` `ramp` `ramp_exit` `corner_1` `slope_body` `straight_1` `corner_2` `straight_2` `corner_3` `straight_3` `reset_body` `corner_4` `descent` `final` `final_jump` |
+| 6 | `start` `north` `north_align` `turn` `east` `clear_ball` `crab` `west` `west_march` `west_align` `exit` `push` `finish` |
+
+第五赛段的入口名和 `route_model.py` 的段名是同一套词（`ramp` = `up_slope`，
+`straight_1/2/3`、`corner_1..4`、`descent` = `right_descent`、`final` =
+`final_zone`），跑到一半的证据日志和调试入口对得上。
+
+几点必须注意：
+
+1. **入口只决定状态机从哪个状态开始，不会把狗搬过去。** 机器人本体必须已经
+   被摆到该段的起点和朝向；否则整段会带着一个固定的初始误差走完。节点每次
+   用非默认入口启动都会以 WARN 打印这句话和该入口的额外前提。
+2. 入口名写错不会让节点起不来：回退到该赛段正常起点，并把整张入口表打进
+   日志（ERROR 级）。
+3. 有前提的入口要一起给参数：
+   - `stage2_entry:=ball_*` 需要 `stage2_ball_return:=track1|track2|track3`，
+     否则撞球子链会回到自己；不给时退回赛道 1 并告警。
+   - `stage4_entry:=obstacle_route` / `post_hit_obstacle` 需要
+     `stage4_dashed_side:=left|right`。
+4. 单独跑一个赛段节点（不经 launch）时用节点参数 `entry_point`：
+
+```bash
+ros2 run control_node stage5_node --ros-args -p entry_point:=ramp
+```
+
+   各赛段原有的 `p1_initial_state` / `second_stage_initial_state` /
+   `p3_initial_state` / `p4_initial_state` / `p5_initial_state` /
+   `p6_initial_state` 仍然可用（写状态名或入口名都行），`entry_point`
+   优先级更高。
+
 也可以给单独赛段加载：
 
 ```bash

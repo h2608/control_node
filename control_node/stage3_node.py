@@ -15,6 +15,18 @@ import numpy as np
 import rclpy
 
 from control_node.stage_common import StageNodeBase, clamp
+from control_node.stage_entry import EntryPoint, StageEntryTable
+
+
+def p3_entry_table():
+    """第三赛段调试入口表（顺序即流程顺序）。"""
+    states = ('P3_STAND_WAIT', 'P3_S_CURVE_CRUISE', 'P3_ALIGN_TRACK')
+    return StageEntryTable(3, 'P3_STAND_WAIT', states, (
+        EntryPoint('start', 'P3_STAND_WAIT', '低身站立等待，完整第三赛段'),
+        EntryPoint('s_curve', 'P3_S_CURVE_CRUISE', '弯-直-弯黄线巡航',
+                   requires=('赛道黄线必须在前向 RGB 视野内',)),
+        EntryPoint('align', 'P3_ALIGN_TRACK', '收尾：赛道居中 + 航向对齐'),
+    ))
 
 
 class P3TrackVisionMixin:
@@ -298,6 +310,12 @@ class Stage3Node(P3TrackVisionMixin, StageNodeBase):
 
     def __init__(self):
         super().__init__('stage3_node', self.STAGE_ID)
+        # 调试入口在 Stage3Node 而不是 P3TrackVisionMixin 里声明：第四赛段也
+        # 复用这个 mixin（GLOBAL_FINAL_P3_ALIGN），它有自己的入口表。
+        self.declare_parameter('p3_initial_state', 'default')
+        self.p3_initial_state = self.resolve_stage_entry(
+            p3_entry_table(),
+            str(self.get_parameter('p3_initial_state').value))
         self.p3_declare_params()
         self.p3_load_params()
         self.p3_init_vision_caches()
@@ -317,10 +335,11 @@ class Stage3Node(P3TrackVisionMixin, StageNodeBase):
 
     def on_activated(self):
         self.p3_state_start_time = None
-        self.state = 'P3_STAND_WAIT'
+        self.state = self.p3_initial_state
+        # 低身站立命令对任何入口都是安全的起手；下一个控制周期该入口接管。
         self.p3_send_stand_command()
         self.p3_stand_sent = True
-        self.get_logger().info('[P3] activated, initial_state=P3_STAND_WAIT')
+        self.get_logger().info(f'[P3] activated, initial_state={self.state}')
 
     def on_rgb_frame(self, frame: np.ndarray):
         self.p3_process_yellow_track(frame)

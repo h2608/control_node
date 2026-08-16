@@ -38,6 +38,10 @@ except ImportError:
 
 from control_node.robot_control_cmd_lcmt import robot_control_cmd_lcmt
 from control_node.robot_interface import create_robot_controller
+from control_node.stage_entry import (
+    SOURCE_DEFAULT,
+    is_default_request,
+)
 
 
 def mission_latched_qos(depth: int = 1) -> QoSProfile:
@@ -143,6 +147,12 @@ class StageNodeBase(Node):
         self.declare_parameter('mission_complete_topic', '/mission/stage_complete')
         self.declare_parameter('mission_inactive_topic', '/mission/stage_inactive')
 
+        # 调试入口：跳过赛段前面的流程，直接从某一段开始（例如第五赛段的
+        # ``ramp`` = 上坡段）。取 default/空 时走赛段正常起点。每个赛段用
+        # StageEntryTable 声明自己的入口名，见 stage_entry.py。
+        # 这个参数只决定状态机的起始状态；机器人本体必须已经被摆到对应位置。
+        self.declare_parameter('entry_point', 'default')
+
         # Physical CyberDog motion API.  Keep these as parameters because the
         # robot namespace contains the individual machine identifier.
         self.declare_parameter('real_motion_servo_cmd_topic', '/motion_servo_cmd')
@@ -182,6 +192,9 @@ class StageNodeBase(Node):
         self.mission_active_topic = self.get_parameter('mission_active_topic').value
         self.mission_complete_topic = self.get_parameter('mission_complete_topic').value
         self.mission_inactive_topic = self.get_parameter('mission_inactive_topic').value
+        self.entry_point_request = str(self.get_parameter('entry_point').value)
+        self.entry_table = None
+        self.entry_resolution = None
 
         # =========================
         # 控制接口：adapter 延迟到激活时创建。self.Ctrl 暂时保留这个名字，
@@ -352,6 +365,46 @@ class StageNodeBase(Node):
         out = Int32()
         out.data = self.stage_id
         self.stage_complete_pub.publish(out)
+
+    # ============================================================
+    # 调试入口
+    # ============================================================
+    def resolve_stage_entry(self, table, legacy_request=None):
+        """解析本赛段的调试入口，返回要进入的状态名。
+
+        优先级：
+        1. 统一的 ``entry_point`` 参数（launch 里的 ``stage<N>_entry``）；
+        2. 赛段原有的 ``*_initial_state`` 参数（直接写状态名，保持兼容）；
+        3. 赛段正常起点。
+
+        入口名非法时不抛异常：回退到正常起点并把整张入口表打进日志，这样写错
+        一个调试参数不会变成一个起不来的节点。
+        """
+        requested = self.entry_point_request
+        if is_default_request(requested):
+            requested = legacy_request
+
+        resolution = table.resolve(requested)
+        self.entry_table = table
+        self.entry_resolution = resolution
+
+        if not resolution.ok:
+            self.get_logger().error('[ENTRY] ' + resolution.message)
+            for line in table.describe():
+                self.get_logger().error('[ENTRY] ' + line)
+        elif resolution.source == SOURCE_DEFAULT:
+            self.get_logger().info('[ENTRY] ' + resolution.message)
+            self.get_logger().info('[ENTRY] ' + table.summary())
+        else:
+            # 非默认入口一定是调试运行：用 warn 让忘记复位的参数足够显眼。
+            self.get_logger().warn('[ENTRY] ' + resolution.message)
+            self.get_logger().warn(
+                '[ENTRY] DEBUG START: the robot must already be placed at this '
+                'point of the course; earlier states are skipped')
+            for requirement in resolution.requires:
+                self.get_logger().warn('[ENTRY] requires: ' + requirement)
+
+        return resolution.state
 
     def on_activated(self):
         """赛段被激活时调用：设置姿态/初始状态。子类实现。"""

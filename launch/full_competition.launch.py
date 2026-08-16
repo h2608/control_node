@@ -47,10 +47,29 @@ def single_stage_condition(n):
     ]))
 
 
+def stage_entry_argument(n, entry_points):
+    """Declare the per-stage debug entry argument.
+
+    Each stage node owns a StageEntryTable (see control_node/stage_entry.py)
+    that maps these names onto its internal states; the node logs the whole
+    table and falls back to its normal start when the name is unknown.
+    """
+    return DeclareLaunchArgument(
+        f'stage{n}_entry',
+        default_value='default',
+        description=(
+            f'Stage {n} debug entry point; default starts the stage normally. '
+            f'Named entries: {entry_points}. A raw state name also works. '
+            'The robot must already be placed at that point of the course.'
+        ),
+    )
+
+
 def stage_node(n, extra_params=None, extra_param_files=None):
     params = {
         'platform': LaunchConfiguration('platform'),
         'use_sim_time': effective_use_sim_time(),
+        'entry_point': LaunchConfiguration(f'stage{n}_entry'),
         'rgb_topic': effective_camera_topic(
             'rgb_topic',
             '/rgb_camera/rgb_camera/image_raw',
@@ -157,6 +176,44 @@ def generate_launch_description():
             'single_stage',
             default_value='false',
             description='If true, launch and run only start_stage, then stop',
+        ),
+        # Per-stage debug entry points.  Combine with single_stage:=true to run
+        # one section of one stage, e.g. only the fifth stage's ramp:
+        #   single_stage:=true start_stage:=5 stage5_entry:=ramp
+        stage_entry_argument(1, 'start, cruise, brake, align, restore, forward, '
+                                'turn, ball, shift'),
+        stage_entry_argument(2, 'start, track1, track1_exit, track1_turn, '
+                                'track1_shift, track2, track2_turn, '
+                                'track2_forward, track3, scan, scan_hit, '
+                                'turn_back, final, final_forward, final_turn, '
+                                'final_align, ball_align, ball_hit, ball_shift'),
+        stage_entry_argument(3, 'start, s_curve, align'),
+        stage_entry_argument(4, 'start, search, bar_center, bar, bar_target, '
+                                'bar_hit, bar_back, bar_yellow, '
+                                'obstacle_center, obstacle, obstacle_route, '
+                                'target, target_hit, upright, post_hit, '
+                                'post_hit_obstacle, final, final_yellow, '
+                                'final_align'),
+        stage_entry_argument(5, 'start, recovery, align, step_up, ramp, '
+                                'ramp_exit, corner_1, slope_body, straight_1, '
+                                'corner_2, straight_2, corner_3, straight_3, '
+                                'reset_body, corner_4, descent, final, '
+                                'final_jump'),
+        stage_entry_argument(6, 'start, north, north_align, turn, east, '
+                                'clear_ball, crab, west, west_march, '
+                                'west_align, exit, push, finish'),
+        DeclareLaunchArgument(
+            'stage2_ball_return',
+            default_value='default',
+            description='Cruise state the Stage-2 ball sub-chain returns to; '
+                        'required by stage2_entry:=ball_* (default reuses the '
+                        'entry state, which would loop)',
+        ),
+        DeclareLaunchArgument(
+            'stage4_dashed_side',
+            default_value='auto',
+            description='Stage-4 dashed-line side (auto/left/right); required '
+                        'by stage4_entry:=obstacle_route and post_hit_obstacle',
         ),
         DeclareLaunchArgument(
             'startup_recovery_enabled',
@@ -288,6 +345,7 @@ def generate_launch_description():
         ),
         stage_node(1),
         stage_node(2, {
+            'p2_ball_return_state': LaunchConfiguration('stage2_ball_return'),
             'fisheye_left_topic': effective_camera_topic(
                 'fisheye_left_topic',
                 '/image_left',
@@ -301,6 +359,7 @@ def generate_launch_description():
         }),
         stage_node(3),
         stage_node(4, {
+            'debug_dashed_side': LaunchConfiguration('stage4_dashed_side'),
             'voice_dir': LaunchConfiguration('voice_dir'),
             'voice_backend': LaunchConfiguration('voice_backend'),
             'voice_topic': LaunchConfiguration('voice_topic'),

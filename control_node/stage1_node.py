@@ -16,6 +16,35 @@ import numpy as np
 import rclpy
 
 from control_node.stage_common import StageNodeBase, clamp
+from control_node.stage_entry import EntryPoint, StageEntryTable
+
+
+def p1_entry_table():
+    """第一赛段调试入口表（顺序即流程顺序）。"""
+    states = (
+        'P1_STAND_WAIT',
+        'P1_STAGE1_CRUISE',
+        'P1_BRAKE_BUFFER',
+        'P1_ALIGN_STOP_LINE',
+        'P1_RESTORE_BODY',
+        'P1_POST_ALIGN_FORWARD',
+        'P1_TURN_LEFT_TO_STAGE2',
+        'P1_APPROACH_BLUE_BALL',
+        'P1_BLIND_LEFT_SHIFT',
+    )
+    return StageEntryTable(1, 'P1_STAND_WAIT', states, (
+        EntryPoint('start', 'P1_STAND_WAIT', '起步站立等待，完整第一赛段'),
+        EntryPoint('cruise', 'P1_STAGE1_CRUISE', '石板路黄线纠偏巡航'),
+        EntryPoint('brake', 'P1_BRAKE_BUFFER', '看到停止线后的刹车缓冲'),
+        EntryPoint('align', 'P1_ALIGN_STOP_LINE', '对停止线调平机身',
+                   requires=('停止线必须在前向 RGB 视野内',)),
+        EntryPoint('restore', 'P1_RESTORE_BODY', '从前倾恢复正常姿态'),
+        EntryPoint('forward', 'P1_POST_ALIGN_FORWARD', '调平后的定时前进'),
+        EntryPoint('turn', 'P1_TURN_LEFT_TO_STAGE2', '左转朝向第二赛段'),
+        EntryPoint('ball', 'P1_APPROACH_BLUE_BALL', '朝蓝球前进',
+                   requires=('蓝球必须在前向 RGB 视野内',)),
+        EntryPoint('shift', 'P1_BLIND_LEFT_SHIFT', '收尾盲走左横移'),
+    ))
 
 
 class Stage1Node(StageNodeBase):
@@ -28,6 +57,9 @@ class Stage1Node(StageNodeBase):
         # =========================
         # 第一赛段参数（全部加 p1_ 前缀，避免和第二赛段变量冲突）
         # =========================
+        # 调试入口：也可以直接写状态名。统一的 entry_point 参数优先。
+        self.declare_parameter('p1_initial_state', 'default')
+
         self.declare_parameter('p1_stand_wait_sec', 0)
         self.declare_parameter('p1_stand_body_height', 0.28)
         self.declare_parameter('p1_forward_pitch', 0.10)
@@ -98,6 +130,10 @@ class Stage1Node(StageNodeBase):
         # =========================
         # 读取第一赛段参数（p1_ 前缀）
         # =========================
+        self.p1_initial_state = self.resolve_stage_entry(
+            p1_entry_table(),
+            str(self.get_parameter('p1_initial_state').value))
+
         self.p1_stand_wait_sec = float(self.get_parameter('p1_stand_wait_sec').value)
         self.p1_stand_body_height = float(self.get_parameter('p1_stand_body_height').value)
         self.p1_forward_pitch = float(self.get_parameter('p1_forward_pitch').value)
@@ -196,12 +232,14 @@ class Stage1Node(StageNodeBase):
         # 该函数位于 ROS 单线程订阅回调中，不能调用 Wait_finish()；否则会连带
         # 阻塞 RGB、深度和控制定时器。立即发送站立命令，再由状态机继续推进。
         self.p1_state_start_time = None
-        self.state = 'P1_STAND_WAIT'
+        self.state = self.p1_initial_state
+        # 站立命令对任何入口都是安全的起手：从中段入口启动时它只是把机身摆正，
+        # 下一个控制周期该入口的动作就接管。
         self.p1_send_stand_command()
         self.p1_stand_sent = True
         self.get_logger().info(
             '[P1] boot stand command sent without blocking ROS callbacks, '
-            'initial_state=P1_STAND_WAIT')
+            f'initial_state={self.state}')
 
     def on_rgb_frame(self, frame: np.ndarray):
         self.p1_process_stage1_yellow(frame)

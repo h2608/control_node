@@ -29,6 +29,7 @@ from control_node.cola_detector import HybridColaDetector
 from control_node.football_vision import detect_football
 from control_node.my_gait import Robot_Ctrl
 from control_node.stage_common import StageNodeBase, clamp
+from control_node.stage_entry import EntryPoint, StageEntryTable
 from control_node.stage3_node import P3TrackVisionMixin
 from control_node.cyberdog_voice import CyberdogVoicePlayer
 
@@ -1783,8 +1784,10 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
         #   第四赛段全部任务结束。
         #   持续发送 STOP。
         # ============================================================
-        self.declare_parameter('p4_initial_state', 'GLOBAL_INITIAL_LATERAL_SHIFT')
-        # self.declare_parameter('p4_initial_state', 'GLOBAL_FINAL_YELLOW_FORWARD')
+        # 也可以写具名调试入口（bar / obstacle / target / final …），
+        # 见 p4_entry_table()。统一的 entry_point 参数（launch 里的
+        # stage4_entry）优先于这一个。
+        self.declare_parameter('p4_initial_state', 'default')
 
 
         # 调试用：当 initial_state 需要依赖 dashed_side 时，可手动指定。
@@ -2227,7 +2230,11 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
             0.1,
             float(self.get_parameter('p4_rgb_stale_stop_s').value)
         )
-        self.p4_initial_state = str(self.get_parameter('p4_initial_state').value)
+        # 入口在参数读取时就解析：写错的调试入口要在节点起来时报出来，
+        # 而不是等到任务控制激活第四赛段的那一刻。
+        self.p4_initial_state = self.resolve_stage_entry(
+            self.p4_entry_table(),
+            str(self.get_parameter('p4_initial_state').value))
         self.debug_dashed_side = str(self.get_parameter('debug_dashed_side').value).lower().strip()
         self.dashed_side_confirm_frames = max(
             1,
@@ -4612,87 +4619,127 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
             label='TIMED_RIGHT_TURN'
         )
 
-    def get_all_state_names(self) -> List[str]:
+    @classmethod
+    def get_all_state_names(cls) -> List[str]:
         """返回所有允许作为 initial_state 的状态名。"""
         return [
-            self.GLOBAL_INITIAL_LATERAL_SHIFT,
-            self.GLOBAL_LATERAL_SEARCH,
-            self.GLOBAL_CENTER_BAR,
-            self.GLOBAL_CENTER_OBSTACLE,
-            self.GLOBAL_SHIFT_AFTER_SUBTASK,
-            self.BAR_FORWARD_UNDER,
-            self.BAR_BODY_LOWER_WAIT,
-            self.BAR_CLEAR_AFTER_UNDER,
-            self.BAR_FORWARD_PITCH_WAIT,
-            self.BAR_SEARCH_TARGET,
-            self.BAR_APPROACH_TARGET,
-            self.BAR_HIT_TARGET,
-            self.BAR_BACKOFF_TO_BAR,
-            self.BAR_BACKOFF_TIMED,
-            self.BAR_BACKOFF_VOICE_WAIT,
-            self.BAR_TURN_TO_YELLOW,
-            self.BAR_YELLOW_FORWARD,
-            self.BAR_TURN_BACK,
-            self.BAR_FLOW_DONE,
-            self.OBSTACLE_FLOW_DONE,
-            self.APPROACH_OBSTACLES,
-            self.DASH_PRE_SIDE_SHIFT,
-            self.OBSTACLE_ROUTE_PRE_TURN1_STEP,
-            self.OBSTACLE_ROUTE_TURN_1,
-            self.OBSTACLE_ROUTE_LATERAL_SCAN,
-            self.OBSTACLE_ROUTE_FORWARD,
-            self.OBSTACLE_ROUTE_PRE_TURN2_LATERAL,
-            self.OBSTACLE_ROUTE_PRE_TURN2_STEP,
-            self.OBSTACLE_ROUTE_TURN_2,
-            self.SEARCH_TARGET_AFTER_TURNS,
-            self.APPROACH_AND_ALIGN_TARGET,
-            self.HIT_TARGET,
-            self.HIT_UPRIGHT_PREPARE,
-            self.HIT_UPRIGHT_RISE,
-            self.HIT_UPRIGHT_HOLD,
-            self.HIT_UPRIGHT_SMOOTH_RETURN,
-            self.HIT_UPRIGHT_READY_STAND,
-            self.HIT_UPRIGHT_RECOVERY,
-            self.HIT_BACKOFF_AFTER_HIT,
-            self.POST_HIT_LEFT_JUMP,
-            self.APPROACH_SELECTED_OBSTACLE_AFTER_HIT,
-            self.POST_HIT_OBSTACLE_VOICE_WAIT,
-            self.POST_HIT_OBS_TURN_1,
-            self.POST_HIT_OBS_FORWARD,
-            self.POST_HIT_OBS_TURN_2,
-            self.POST_HIT_PRE_FINAL_FORWARD,
-            self.POST_HIT_FINAL_FORWARD,
-            self.FINAL_LEFT_JUMP,
-            self.OBSTACLE_RESTORE_NORMAL_AFTER_FINAL_TURN,
-            self.GLOBAL_FINAL_RIGHT_JUMP,
-            self.GLOBAL_FINAL_YELLOW_FORWARD,
-            self.GLOBAL_FINAL_LEFT_JUMP,
-            self.GLOBAL_FINAL_P3_ALIGN,
-            self.GLOBAL_FINAL_RIGHT_SHIFT_AFTER_LEFT_JUMP,
-            self.DONE,
+            cls.GLOBAL_INITIAL_LATERAL_SHIFT,
+            cls.GLOBAL_LATERAL_SEARCH,
+            cls.GLOBAL_CENTER_BAR,
+            cls.GLOBAL_CENTER_OBSTACLE,
+            cls.GLOBAL_SHIFT_AFTER_SUBTASK,
+            cls.BAR_FORWARD_UNDER,
+            cls.BAR_BODY_LOWER_WAIT,
+            cls.BAR_CLEAR_AFTER_UNDER,
+            cls.BAR_FORWARD_PITCH_WAIT,
+            cls.BAR_SEARCH_TARGET,
+            cls.BAR_APPROACH_TARGET,
+            cls.BAR_HIT_TARGET,
+            cls.BAR_BACKOFF_TO_BAR,
+            cls.BAR_BACKOFF_TIMED,
+            cls.BAR_BACKOFF_VOICE_WAIT,
+            cls.BAR_TURN_TO_YELLOW,
+            cls.BAR_YELLOW_FORWARD,
+            cls.BAR_TURN_BACK,
+            cls.BAR_FLOW_DONE,
+            cls.OBSTACLE_FLOW_DONE,
+            cls.APPROACH_OBSTACLES,
+            cls.DASH_PRE_SIDE_SHIFT,
+            cls.OBSTACLE_ROUTE_PRE_TURN1_STEP,
+            cls.OBSTACLE_ROUTE_TURN_1,
+            cls.OBSTACLE_ROUTE_LATERAL_SCAN,
+            cls.OBSTACLE_ROUTE_FORWARD,
+            cls.OBSTACLE_ROUTE_PRE_TURN2_LATERAL,
+            cls.OBSTACLE_ROUTE_PRE_TURN2_STEP,
+            cls.OBSTACLE_ROUTE_TURN_2,
+            cls.SEARCH_TARGET_AFTER_TURNS,
+            cls.APPROACH_AND_ALIGN_TARGET,
+            cls.HIT_TARGET,
+            cls.HIT_UPRIGHT_PREPARE,
+            cls.HIT_UPRIGHT_RISE,
+            cls.HIT_UPRIGHT_HOLD,
+            cls.HIT_UPRIGHT_SMOOTH_RETURN,
+            cls.HIT_UPRIGHT_READY_STAND,
+            cls.HIT_UPRIGHT_RECOVERY,
+            cls.HIT_BACKOFF_AFTER_HIT,
+            cls.POST_HIT_LEFT_JUMP,
+            cls.APPROACH_SELECTED_OBSTACLE_AFTER_HIT,
+            cls.POST_HIT_OBSTACLE_VOICE_WAIT,
+            cls.POST_HIT_OBS_TURN_1,
+            cls.POST_HIT_OBS_FORWARD,
+            cls.POST_HIT_OBS_TURN_2,
+            cls.POST_HIT_PRE_FINAL_FORWARD,
+            cls.POST_HIT_FINAL_FORWARD,
+            cls.FINAL_LEFT_JUMP,
+            cls.OBSTACLE_RESTORE_NORMAL_AFTER_FINAL_TURN,
+            cls.GLOBAL_FINAL_RIGHT_JUMP,
+            cls.GLOBAL_FINAL_YELLOW_FORWARD,
+            cls.GLOBAL_FINAL_LEFT_JUMP,
+            cls.GLOBAL_FINAL_P3_ALIGN,
+            cls.GLOBAL_FINAL_RIGHT_SHIFT_AFTER_LEFT_JUMP,
+            cls.DONE,
         ]
+
+    @classmethod
+    def p4_entry_table(cls) -> StageEntryTable:
+        """第四赛段调试入口表。
+
+        状态集合沿用 get_all_state_names()（即原有的合法 initial_state 列表），
+        在它上面加一层具名入口，方便只调限高杆、只调障碍物或只调收尾。
+        """
+        dashed_note = 'dashed_side：用 debug_dashed_side:=left/right 指定'
+        return StageEntryTable(
+            cls.STAGE_ID,
+            cls.GLOBAL_INITIAL_LATERAL_SHIFT,
+            cls.get_all_state_names(),
+            (
+                EntryPoint('start', cls.GLOBAL_INITIAL_LATERAL_SHIFT,
+                           '启动预横移，完整第四赛段'),
+                EntryPoint('search', cls.GLOBAL_LATERAL_SEARCH,
+                           '全局横移搜索限高杆/障碍物'),
+                # 限高杆流程
+                EntryPoint('bar_center', cls.GLOBAL_CENTER_BAR, '限高杆横向居中',
+                           requires=('限高杆必须在前向 RGB 视野内',)),
+                EntryPoint('bar', cls.BAR_FORWARD_UNDER, '低身穿过限高杆'),
+                EntryPoint('bar_target', cls.BAR_SEARCH_TARGET, '杆后搜索目标'),
+                EntryPoint('bar_hit', cls.BAR_HIT_TARGET, '杆后击打目标'),
+                EntryPoint('bar_back', cls.BAR_BACKOFF_TO_BAR, '击打后退回限高杆'),
+                EntryPoint('bar_yellow', cls.BAR_TURN_TO_YELLOW, '限高杆流程收尾：转向黄线'),
+                # 障碍物流程
+                EntryPoint('obstacle_center', cls.GLOBAL_CENTER_OBSTACLE,
+                           '蓝色障碍物横向居中',
+                           requires=('蓝色障碍物必须在前向 RGB 视野内',)),
+                EntryPoint('obstacle', cls.APPROACH_OBSTACLES, '靠近障碍物'),
+                EntryPoint('obstacle_route', cls.OBSTACLE_ROUTE_PRE_TURN1_STEP,
+                           '绕障固定路线（第一次转向前）', requires=(dashed_note,)),
+                EntryPoint('target', cls.SEARCH_TARGET_AFTER_TURNS,
+                           '绕障后搜索目标'),
+                EntryPoint('target_hit', cls.HIT_TARGET, '击打目标'),
+                EntryPoint('upright', cls.HIT_UPRIGHT_PREPARE, '直立击打动作'),
+                EntryPoint('post_hit', cls.HIT_BACKOFF_AFTER_HIT, '击打后后退'),
+                EntryPoint('post_hit_obstacle',
+                           cls.APPROACH_SELECTED_OBSTACLE_AFTER_HIT,
+                           '击打后走向选定障碍物', requires=(dashed_note,)),
+                # 收尾
+                EntryPoint('final', cls.GLOBAL_FINAL_RIGHT_JUMP, '全局收尾右跳'),
+                EntryPoint('final_yellow', cls.GLOBAL_FINAL_YELLOW_FORWARD,
+                           '收尾沿黄线前进'),
+                EntryPoint('final_align', cls.GLOBAL_FINAL_P3_ALIGN,
+                           '收尾赛道对齐，之后上报完成'),
+            ),
+        )
 
     def enter_initial_state(self):
         """
-        根据 initial_state 参数进入指定初始状态，方便单独调试某一段流程。
+        根据调试入口进入指定初始状态，方便单独调试某一段流程。
 
         说明：
-        1. 正常跑完整流程时，initial_state 保持默认 APPROACH_OBSTACLES。
+        1. 正常跑完整流程时不传参数，从 GLOBAL_INITIAL_LATERAL_SHIFT 开始。
         2. 如果直接从依赖 dashed_side 的状态开始，建议同时传入：
            -p debug_dashed_side:=left
            或
            -p debug_dashed_side:=right
         """
-        valid_states = self.get_all_state_names()
-
-        if self.p4_initial_state not in valid_states:
-            self.get_logger().warn(
-                f"[INIT_STATE] invalid initial_state='{self.p4_initial_state}', "
-                f"fallback to {self.GLOBAL_INITIAL_LATERAL_SHIFT}. "
-                f"valid_states={valid_states}"
-            )
-            self.p4_initial_state = self.GLOBAL_INITIAL_LATERAL_SHIFT
-
         if self.debug_dashed_side in ('left', 'right'):
             self.dashed_side = self.debug_dashed_side
             self.get_logger().info(f"[INIT_STATE] debug_dashed_side={self.dashed_side}")
