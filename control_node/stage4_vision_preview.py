@@ -501,7 +501,7 @@ def _draw_condition_panel(image, record, title, x, y, width):
     cv2.addWeighted(overlay, 0.72, image, 0.28, 0.0, image)
     _put_label(image, title, (x + 7, y + 18), (255, 255, 255), 0.40)
     if record is None:
-        _put_label(image, 'NO PASSED CANDIDATE', (x + 7, y + 40),
+        _put_label(image, 'NO COLOR CONTOUR TO EVALUATE', (x + 7, y + 40),
                    (0, 165, 255), 0.38)
         return
     result_color = (60, 230, 60) if record['accepted'] else (60, 60, 255)
@@ -542,7 +542,10 @@ def _bar_obstacle_debug_view(frame, depth, bar_detector, bar_cfg,
                 if tuple(record['bbox']) == tuple(selected_bbox):
                     records.insert(0, records.pop(index))
                     break
-        return [record for record in records if record['accepted']][:2]
+        # Keep the two best visible candidates even when they failed.  The
+        # panel below will then show every measured value, threshold and failed
+        # condition instead of becoming empty when the detector returns None.
+        return records[:2]
 
     bar_bbox = selected_bar.bbox_img if selected_bar is not None else None
     bar_details = prepare(bar_records, bar_bbox)
@@ -556,7 +559,11 @@ def _bar_obstacle_debug_view(frame, depth, bar_detector, bar_cfg,
             thickness = 3 if any(record is item for item in details) else 1
             cv2.rectangle(view, (x1, y1), (x2, y2), color, thickness)
 
-    selected_obstacles = obstacle_details
+    # Only accepted obstacle records may form the control pair.  Failed
+    # candidates stay visible in the panels but must not look like a selected
+    # two-obstacle target in the image overlay.
+    selected_obstacles = [
+        record for record in obstacle_details if record['accepted']]
     if len(selected_obstacles) == 2:
         centers = []
         for record in selected_obstacles:
@@ -581,17 +588,17 @@ def _bar_obstacle_debug_view(frame, depth, bar_detector, bar_cfg,
     panel_width = max(250, w // 2 - 8)
     _draw_condition_panel(
         canvas, bar_details[0] if len(bar_details) > 0 else None,
-        'BAR PASS 1', 5, h + 5, panel_width)
+        'BAR CANDIDATE 1 (PASS / FAIL)', 5, h + 5, panel_width)
     _draw_condition_panel(
         canvas, bar_details[1] if len(bar_details) > 1 else None,
-        'BAR PASS 2', w // 2 + 3, h + 5, panel_width)
+        'BAR CANDIDATE 2 (PASS / FAIL)', w // 2 + 3, h + 5, panel_width)
     obstacle_row_y = h + 10 + panel_row_height
     _draw_condition_panel(
         canvas, obstacle_details[0] if len(obstacle_details) > 0 else None,
-        'OBSTACLE PASS 1', 5, obstacle_row_y, panel_width)
+        'OBSTACLE CANDIDATE 1 (PASS / FAIL)', 5, obstacle_row_y, panel_width)
     _draw_condition_panel(
         canvas, obstacle_details[1] if len(obstacle_details) > 1 else None,
-        'OBSTACLE PASS 2', w // 2 + 3, obstacle_row_y, panel_width)
+        'OBSTACLE CANDIDATE 2 (PASS / FAIL)', w // 2 + 3, obstacle_row_y, panel_width)
     return canvas
 
 
