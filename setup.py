@@ -32,11 +32,6 @@ setup(
             'mission_control_node = control_node.mission_control_node:main',
             'stand_node = control_node.stand_node:main',
             'bridge_perception_replay = control_node.bridge_perception_replay:main',
-            # Stationary hardware debug tools brought over from the robot.
-            # Run them only with every other motion node stopped.
-            'body_hold = control_node.body_hold:main',
-            'target_hit_enter_test = control_node.target_hit_enter_test:main',
-            'turn_pose_test = control_node.turn_pose_test:main',
         ],
     },
 )

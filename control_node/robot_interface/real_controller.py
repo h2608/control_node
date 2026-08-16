@@ -415,11 +415,7 @@ class RealRobotControlAdapter:
 
         return True
 
-    def stop_motion(self, wait_finish=True):
-        # wait_finish exists for signature parity with the simulator backend.
-        # SERVO_END *is* the stop here: there is no separate completion to
-        # wait on, so the flag has nothing to skip.
-        del wait_finish
+    def stop_motion(self):
         with self._lock:
             was_active = self._servo_active
             if not was_active:

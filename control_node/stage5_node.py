@@ -3093,9 +3093,7 @@ class Stage5Node(StageNodeBase):
         # the old mode=12 behaviour so Gazebo regression remains unchanged.
         if self.Ctrl is None:
             return
-        # Fire-and-forget, as before the backend migration: this runs inside
-        # the Stage-5 control loop, which polls action completion itself.
-        self.Ctrl.stop_motion(wait_finish=False)
+        self.Ctrl.stop_motion()
         self.get_logger().info('[P5_CMD] STOP sent', throttle_duration_sec=1.0)
 
     def p5_send_velocity_command(

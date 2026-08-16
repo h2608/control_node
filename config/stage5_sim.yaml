@@ -70,13 +70,6 @@
     p5_fall_recovery_stand_timeout_s: 45.0
     p5_fall_recovery_total_timeout_s: 90.0
 
-    # 上桥步态：代码默认值在 2026-08-16 并入真机整定后改成了 3.0 s / 0.30 m·s⁻¹
-    # （真机上桥更慢更稳）。仿真回归是在 2.0 s / 0.45 m·s⁻¹ 上跑通到 P5_DONE 的，
-    # 这两条只有 physical 档单独覆盖过 vx，所以在这里显式钉回旧值，
-    # 保证 Gazebo 行为不因真机整定而改变。
-    p5_step_up_duration_s: 2.0
-    p5_up_slope_vx: 0.45
-
     # 视觉门控状态整体超时：远大于正常段耗时，只拦截真正的卡死。
     p5_up_slope_timeout_s: 60.0
     p5_right_slope_1_timeout_s: 45.0

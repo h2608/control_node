@@ -11,17 +11,7 @@ class SimRobotControlAdapter:
     def __init__(self, parent_node):
         self.node = parent_node
         self._ctrl = Robot_Ctrl()
-        # Share the stage node's command message rather than owning a second
-        # one.  The locomotion controller accepts a packet only when its
-        # life_count differs from the last accepted value
-        # (command_interface.cpp: `if (lcm_cmd_.life_count == life_count_)`),
-        # so two independent counters publishing on robot_control_cmd will
-        # eventually collide and the colliding command is dropped silently.
-        # Stages that still build actions from node.msg (Stage 5's
-        # p5_send_action_once) must therefore share one counter with move().
-        self._semantic_msg = getattr(parent_node, 'msg', None)
-        if self._semantic_msg is None:
-            self._semantic_msg = robot_control_cmd_lcmt()
+        self._semantic_msg = robot_control_cmd_lcmt()
         if not hasattr(self._semantic_msg, 'life_count'):
             self._semantic_msg.life_count = 0
 
@@ -53,15 +43,9 @@ class SimRobotControlAdapter:
         self._inc_life()
         self._ctrl.Send_cmd(msg)
 
-    def stop_motion(self, wait_finish=True):
+    def stop_motion(self):
         # Preserve the old simulator STOP behaviour exactly.  The physical
         # backend implements this as SERVO_END instead.
-        #
-        # wait_finish mirrors the pre-migration split: StageNodeBase's
-        # send_stop_command() blocked on Wait_finish(12, 0), while Stage 5's
-        # p5_send_stop_command() was fire-and-forget because it runs inside
-        # the 30-50 Hz control loop and polls completion itself.  Wait_finish
-        # blocks for up to 10 s, which would stall that loop.
         msg = self._semantic_msg
         msg.mode = 12
         msg.gait_id = 0
@@ -71,8 +55,6 @@ class SimRobotControlAdapter:
         msg.pos_des = [0.0, 0.0, 0.0]
         self._inc_life()
         self._ctrl.Send_cmd(msg)
-        if not wait_finish:
-            return True
         return bool(self._ctrl.Wait_finish(12, 0))
 
     def recovery_stand(self, wait_finish=True):

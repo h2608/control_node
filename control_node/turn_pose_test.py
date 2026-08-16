@@ -18,7 +18,7 @@ import time
 import rclpy
 from rclpy.node import Node
 
-from control_node.robot_interface import create_robot_controller
+from robot_interface import create_robot_controller
 
 
 class TurnPoseTestNode(Node):

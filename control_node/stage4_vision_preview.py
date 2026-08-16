@@ -52,14 +52,15 @@ STREAMS = collections.OrderedDict([
     ('bar_obstacle', {
         'label': '限高杆与障碍物', 'primary': True, 'withPanel': True}),
     ('bar_obstacle_debug', {
-        'label': '限高杆/障碍物判定条件', 'primary': True, 'tall': True}),
+        'label': '限高杆/障碍物判定条件（PASS+FAIL）', 'primary': True, 'tall': True}),
     ('targets', {
         'label': 'RGB 目标检测（白球、可乐）',
         'primary': True, 'withPanel': True}),
     ('basketball_ai', {
-        'label': 'AI 相机篮球检测',
+        'label': 'AI 相机篮球检测（PASS+FAIL）',
         'primary': True, 'withPanel': True}),
     ('cola_debug', {'label': '可乐判定条件（通过与未通过）', 'primary': True}),
+    ('masks', {'label': '颜色掩膜总览（HSV / FOOTBALL B-W）', 'primary': True}),
     ('yellow', {'label': '黄线检测', 'primary': True}),
 ])
 
@@ -83,7 +84,7 @@ footer{max-width:1800px;margin:auto;padding:0 16px 18px;color:var(--muted);font-
 <body>
 <header><div><div class="title">CyberDog 第四赛段视觉调试</div><div class="subtitle">只订阅相机 · 不发送运动命令 · 页面适合 SSH 端口转发</div></div><div class="controls"><span id="summary" class="pill">正在连接…</span><label>刷新 <select id="rate"><option selected>1</option><option>2</option><option>3</option><option>5</option></select> FPS</label><button id="pause">暂停</button></div></header>
 <main><div id="notice" class="notice" hidden></div><section id="grid" class="grid"></section><section class="details"><div class="detail"><b>相机</b><pre id="camera">等待数据</pre></div><div class="detail"><b>检测结果</b><pre id="detections">等待数据</pre></div><div class="detail"><b>参数模式</b><pre id="config">等待数据</pre></div></section></main>
-<footer>画面分别显示：限高杆与障碍物、限高杆/障碍物逐条件判定、RGB 白球/可乐目标、AI 相机篮球与上沿触发参数、可乐逐条件判定、虚线与终点横向黄线。绿色竖线是图像中心，矩形表示 ROI；页面进入后台后会暂停拉图。</footer>
+<footer>画面分别显示：限高杆与障碍物、限高杆/障碍物逐条件判定、RGB 白球/可乐目标、AI 相机篮球与上沿触发参数、可乐逐条件判定、颜色掩膜总览、虚线与终点横向黄线。绿色竖线是图像中心，矩形表示 ROI；调试图中绿色框=通过、红色框=被参数过滤，面板显示当前值与阈值；页面进入后台后会暂停拉图。</footer>
 <script>
 'use strict';
 const defs=__STREAM_DEFINITIONS__,app={paused:false,hidden:document.hidden,period:__CLIENT_PERIOD_MS__,statusFails:0};
@@ -490,6 +491,94 @@ def _obstacle_debug_records(debug_infos, cfg):
     return records
 
 
+
+def _ball_debug_records(frame, cfg):
+    """Mirror BallDetector filtering and retain both PASS and FAIL contours.
+
+    This is exact for the BallDetector used by the AI-camera basketball path.
+    Keeping rejected contours is useful when a visible blue/orange ball is
+    discarded by area/radius/circularity/aspect/ROI-center conditions.
+    """
+    h, w = frame.shape[:2]
+    x1 = max(0, min(w - 1, int(w * cfg['roi_x_ratio_min'])))
+    x2 = max(x1 + 1, min(w, int(w * cfg['roi_x_ratio_max'])))
+    y1 = max(0, min(h - 1, int(h * cfg['roi_y_ratio_min'])))
+    y2 = max(y1 + 1, min(h, int(h * cfg['roi_y_ratio_max'])))
+    roi = frame[y1:y2, x1:x2]
+    roi_h, roi_w = roi.shape[:2]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    lower = np.array([cfg['h_min'], cfg['s_min'], cfg['v_min']], np.uint8)
+    upper = np.array([cfg['h_max'], cfg['s_max'], cfg['v_max']], np.uint8)
+    mask = cv2.inRange(hsv, lower, upper)
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_OPEN,
+        np.ones((int(cfg['open_kernel']), int(cfg['open_kernel'])), np.uint8))
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_CLOSE,
+        np.ones((int(cfg['close_kernel']), int(cfg['close_kernel'])), np.uint8))
+    contours = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+    roi_center_x = roi_w * 0.5
+    records = []
+    min_display_area = max(8.0, float(cfg['min_area']) * 0.12)
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        rx, ry, rw, rh = cv2.boundingRect(contour)
+        if rw <= 0 or rh <= 0 or area < min_display_area:
+            continue
+        (cx, cy), radius = cv2.minEnclosingCircle(contour)
+        perimeter = cv2.arcLength(contour, True)
+        circularity = ((4.0 * math.pi * area) / (perimeter * perimeter)
+                       if perimeter > 1e-6 else 0.0)
+        wh_ratio = rw / float(max(rh, 1))
+        center_y_ratio = cy / float(max(roi_h, 1))
+        x_dist_norm = abs(cx - roi_center_x) / max(roi_w * 0.5, 1.0)
+        center_bonus = 1.0 - x_dist_norm
+        checks = [
+            _condition('area', '%.0f' % area,
+                       '%.0f..%.0f' % (cfg['min_area'], cfg['max_area']),
+                       cfg['min_area'] <= area <= cfg['max_area']),
+            _condition('radius', '%.1f' % radius,
+                       '%.1f..%.1f' % (cfg['min_radius'], cfg['max_radius']),
+                       cfg['min_radius'] <= radius <= cfg['max_radius']),
+            _condition('circularity', '%.3f' % circularity,
+                       '>=%.3f' % cfg['min_circularity'],
+                       circularity >= cfg['min_circularity']),
+            _condition('wh_ratio', '%.3f' % wh_ratio,
+                       '%.3f..%.3f' % (cfg['min_wh_ratio'], cfg['max_wh_ratio']),
+                       cfg['min_wh_ratio'] <= wh_ratio <= cfg['max_wh_ratio']),
+            _condition('center_y', '%.3f' % center_y_ratio,
+                       '<=%.3f' % cfg['max_center_y_ratio_in_roi'],
+                       center_y_ratio <= cfg['max_center_y_ratio_in_roi']),
+        ]
+        score = (radius * float(cfg['radius_score_gain'])) * max(
+            circularity, 0.0) * (
+                float(cfg['center_weight_base']) +
+                float(cfg['center_weight_gain']) * center_bonus)
+        records.append({
+            'bbox': (x1 + rx, y1 + ry, x1 + rx + rw, y1 + ry + rh),
+            'area': area,
+            'score': float(score),
+            'checks': checks,
+            'accepted': all(item['passed'] for item in checks),
+            'radius': float(radius),
+            'circularity': float(circularity),
+            'wh_ratio': float(wh_ratio),
+            'mask': mask,
+        })
+    records.sort(key=lambda item: (
+        item['accepted'],
+        sum(check['passed'] for check in item['checks']),
+        item['score'], item['area']), reverse=True)
+    return records, mask
+
+
+def _failed_names(record, limit=3):
+    if record is None:
+        return []
+    return [item['name'] for item in record.get('checks', [])
+            if not item['passed']][:limit]
+
 def _draw_condition_panel(image, record, title, x, y, width):
     checks = record['checks'] if record is not None else []
     height = 52 + 15 * len(checks)
@@ -501,7 +590,7 @@ def _draw_condition_panel(image, record, title, x, y, width):
     cv2.addWeighted(overlay, 0.72, image, 0.28, 0.0, image)
     _put_label(image, title, (x + 7, y + 18), (255, 255, 255), 0.40)
     if record is None:
-        _put_label(image, 'NO PASSED CANDIDATE', (x + 7, y + 40),
+        _put_label(image, 'NO VISIBLE CANDIDATE', (x + 7, y + 40),
                    (0, 165, 255), 0.38)
         return
     result_color = (60, 230, 60) if record['accepted'] else (60, 60, 255)
@@ -519,19 +608,21 @@ def _draw_condition_panel(image, record, title, x, y, width):
 
 def _bar_obstacle_debug_view(frame, depth, bar_detector, bar_cfg,
                              selected_bar, obstacle_infos, obstacle_cfg):
+    """Show accepted AND rejected bar/obstacle candidates with live rules."""
     view = frame.copy()
     h, w = view.shape[:2]
     cv2.line(view, (w // 2, 0), (w // 2, h - 1), (0, 255, 0), 1)
-    bar_records = _bar_debug_records(
-        frame, depth, bar_detector, bar_cfg)
+    bar_records = _bar_debug_records(frame, depth, bar_detector, bar_cfg)
     obstacle_records = _obstacle_debug_records(obstacle_infos, obstacle_cfg)
 
     def prepare(records, selected_bbox=None, obstacle_order=False):
+        # Keep rejected candidates.  Previously this function returned only
+        # accepted records, which made the most useful FAIL parameters vanish.
         if obstacle_order:
-            # 与控制节点一致：通过候选优先，再按外接框底边从低到高、面积从大到小排序。
             records.sort(key=lambda item: (
-                item['accepted'], int(item['bbox'][3]), item['area']),
-                reverse=True)
+                item['accepted'],
+                sum(check['passed'] for check in item['checks']),
+                int(item['bbox'][3]), item['area']), reverse=True)
         else:
             records.sort(key=lambda item: (
                 item['accepted'],
@@ -542,21 +633,27 @@ def _bar_obstacle_debug_view(frame, depth, bar_detector, bar_cfg,
                 if tuple(record['bbox']) == tuple(selected_bbox):
                     records.insert(0, records.pop(index))
                     break
-        return [record for record in records if record['accepted']][:2]
+        # Two panels: selected/PASS first, then best alternative or best FAIL.
+        return records[:2]
 
     bar_bbox = selected_bar.bbox_img if selected_bar is not None else None
     bar_details = prepare(bar_records, bar_bbox)
     obstacle_details = prepare(obstacle_records, obstacle_order=True)
 
     for prefix, records in (('B', bar_records), ('O', obstacle_records)):
-        for record in records[:10]:
+        details = bar_details if prefix == 'B' else obstacle_details
+        for index, record in enumerate(records[:10], 1):
             x1, y1, x2, y2 = [int(value) for value in record['bbox']]
             color = (0, 220, 0) if record['accepted'] else (0, 0, 255)
-            details = bar_details if prefix == 'B' else obstacle_details
             thickness = 3 if any(record is item for item in details) else 1
             cv2.rectangle(view, (x1, y1), (x2, y2), color, thickness)
+            failed = _failed_names(record, 2)
+            summary = 'PASS' if record['accepted'] else 'FAIL:' + ','.join(failed)
+            _put_label(view, '%s%d %s' % (prefix, index, summary),
+                       (x1, y1 - 5), color, 0.34)
 
-    selected_obstacles = obstacle_details
+    # Pair-center is meaningful only for two candidates that actually passed.
+    selected_obstacles = [item for item in obstacle_details if item['accepted']]
     if len(selected_obstacles) == 2:
         centers = []
         for record in selected_obstacles:
@@ -570,28 +667,53 @@ def _bar_obstacle_debug_view(frame, depth, bar_detector, bar_cfg,
         cv2.circle(view, pair_center, 7, (0, 255, 255), -1)
 
     all_details = bar_details + obstacle_details
-    max_checks = max(
-        [len(detail['checks']) for detail in all_details] or [0])
-    panel_row_height = max(115, 62 + 15 * max_checks)
-    panel_height = panel_row_height * 2 + 15
+    max_checks = max([len(item['checks']) for item in all_details] or [5])
+    config_height = 78
+    panel_row_height = max(120, 62 + 15 * max_checks)
+    panel_height = config_height + panel_row_height * 2 + 15
     canvas = np.zeros((h + panel_height, w, 3), dtype=np.uint8)
     canvas[:] = (8, 17, 30)
     canvas[:h, :w] = view
     cv2.line(canvas, (0, h), (w - 1, h), (65, 82, 105), 1)
+
+    # Always-visible parameters: these matter when HSV itself produces no box.
+    bar_hsv = ('BAR HSV H=%d..%d S=%d..%d V=%d..%d  ROI x=%.2f..%.2f y=%.2f..%.2f'
+               % (bar_cfg['h_min'], bar_cfg['h_max'],
+                  bar_cfg['s_min'], bar_cfg['s_max'],
+                  bar_cfg['v_min'], bar_cfg['v_max'],
+                  bar_cfg['roi_x_ratio_min'], bar_cfg['roi_x_ratio_max'],
+                  bar_cfg['roi_y_ratio_min'], bar_cfg['roi_y_ratio_max']))
+    bar_rules = ('BAR rules area>=%g width>=%g height<=%g aspect=%.2f..%.2f  morph open=%s close=%sx%s'
+                 % (bar_cfg['min_area'], bar_cfg['min_width'], bar_cfg['max_height'],
+                    bar_cfg['min_aspect_ratio'], bar_cfg['max_aspect_ratio'],
+                    bar_cfg['open_kernel'], bar_cfg['close_kernel_h'],
+                    bar_cfg['close_kernel_w']))
+    obs_hsv = ('OBS HSV H=%d..%d S=%d..%d V=%d..%d  area=%g..%g aspect=%.2f..%.2f bottom>=%.2f'
+               % (obstacle_cfg['h_min'], obstacle_cfg['h_max'],
+                  obstacle_cfg['s_min'], obstacle_cfg['s_max'],
+                  obstacle_cfg['v_min'], obstacle_cfg['v_max'],
+                  obstacle_cfg['min_area'], obstacle_cfg['max_area'],
+                  obstacle_cfg['min_aspect_ratio'], obstacle_cfg['max_aspect_ratio'],
+                  obstacle_cfg['min_bottom_y_ratio_in_roi']))
+    _put_label(canvas, bar_hsv, (8, h + 18), (255, 255, 255), 0.32)
+    _put_label(canvas, bar_rules, (8, h + 38), (200, 220, 255), 0.30)
+    _put_label(canvas, obs_hsv, (8, h + 58), (255, 180, 80), 0.31)
+
     panel_width = max(250, w // 2 - 8)
+    first_row_y = h + config_height
+    second_row_y = first_row_y + panel_row_height + 5
     _draw_condition_panel(
         canvas, bar_details[0] if len(bar_details) > 0 else None,
-        'BAR PASS 1', 5, h + 5, panel_width)
+        'BAR BEST 1', 5, first_row_y, panel_width)
     _draw_condition_panel(
         canvas, bar_details[1] if len(bar_details) > 1 else None,
-        'BAR PASS 2', w // 2 + 3, h + 5, panel_width)
-    obstacle_row_y = h + 10 + panel_row_height
+        'BAR BEST 2', w // 2 + 3, first_row_y, panel_width)
     _draw_condition_panel(
         canvas, obstacle_details[0] if len(obstacle_details) > 0 else None,
-        'OBSTACLE PASS 1', 5, obstacle_row_y, panel_width)
+        'OBSTACLE BEST 1', 5, second_row_y, panel_width)
     _draw_condition_panel(
         canvas, obstacle_details[1] if len(obstacle_details) > 1 else None,
-        'OBSTACLE PASS 2', w // 2 + 3, obstacle_row_y, panel_width)
+        'OBSTACLE BEST 2', w // 2 + 3, second_row_y, panel_width)
     return canvas
 
 
@@ -726,13 +848,21 @@ def _target_trigger_view(image, targets, cfg):
                 hit_area, hit_radius, 'YES' if hit_ok else 'NO'),
             color,
         ))
+    if by_type.get('white_ball') is None:
+        lines.append((
+            'WHITE detector=FootballDetector: no final Hough candidate; inspect FOOTBALL B/W mask',
+            (0, 0, 255)))
+    lines.append((
+        'NOTE: WHITE rejected Hough internals are not exposed by FootballDetector wrapper',
+        (0, 165, 255)))
     return _append_status_panel(
-        image, 'RGB TARGET SLOW / HIT TRIGGERS', lines, 145)
+        image, 'RGB TARGET SLOW / HIT TRIGGERS', lines,
+        max(170, 46 + 18 * len(lines)))
 
 
 def _basketball_ai_view(image, det, detector_cfg, trigger_cfg, topic,
-                        frame_age_sec, trigger_count):
-    """Draw AI-camera basketball ROI, top-edge thresholds and parameters."""
+                         frame_age_sec, trigger_count):
+    """AI basketball debug: retain rejected BallDetector contours and rules."""
     view = image.copy()
     h, w = view.shape[:2]
     cv2.line(view, (w // 2, 0), (w // 2, h - 1), (0, 255, 0), 1)
@@ -743,18 +873,28 @@ def _basketball_ai_view(image, det, detector_cfg, trigger_cfg, topic,
     upright_y = max(0, min(h - 1, int(round(h * upright_ratio))))
     cv2.line(view, (0, slow_y), (w - 1, slow_y), (0, 255, 255), 1)
     cv2.line(view, (0, upright_y), (w - 1, upright_y), (0, 0, 255), 1)
-    _put_label(view, 'SLOW top<=%.3f' % slow_ratio,
-               (5, min(h - 5, slow_y + 16)), (0, 255, 255), 0.40)
-    _put_label(view, 'UPRIGHT top<=%.3f' % upright_ratio,
-               (5, max(16, upright_y - 5)), (0, 0, 255), 0.40)
+
+    ball_records, _ = _ball_debug_records(image, detector_cfg)
+    selected_bbox = tuple(det.bbox_img) if det is not None else None
+    detail = None
+    for index, record in enumerate(ball_records[:10], 1):
+        x1, y1, x2, y2 = [int(v) for v in record['bbox']]
+        is_selected = selected_bbox is not None and tuple(record['bbox']) == selected_bbox
+        if is_selected:
+            detail = record
+        color = (0, 220, 0) if record['accepted'] else (0, 0, 255)
+        cv2.rectangle(view, (x1, y1), (x2, y2), color, 3 if is_selected else 1)
+        failed = _failed_names(record, 2)
+        summary = 'PASS' if record['accepted'] else 'FAIL:' + ','.join(failed)
+        _put_label(view, 'BB%d %s' % (index, summary),
+                   (x1, y1 - 5), color, 0.34)
+    if detail is None and ball_records:
+        detail = ball_records[0]
 
     top_ratio = None
     if det is not None:
         x1, y1, x2, _ = [int(value) for value in det.bbox_img]
         top_ratio = float(y1) / float(max(h, 1))
-        _draw_detection(
-            view, det, (255, 100, 0),
-            'BLUE BALL top=%dpx/%.3f' % (y1, top_ratio), None)
         cv2.line(view, (x1, y1), (x2, y1), (255, 0, 255), 2)
 
     max_age = trigger_cfg['basketball_ai_max_age_s']
@@ -766,45 +906,46 @@ def _basketball_ai_view(image, det, detector_cfg, trigger_cfg, topic,
     upright_ok = top_ratio is not None and top_ratio <= upright_ratio
     lines = [
         ('topic=%s' % topic, (210, 210, 210)),
-        ('frame age=%s  max=%.2fs  state=%s' % (
+        ('frame age=%s max=%.2fs state=%s' % (
             '-' if frame_age_sec is None else '%.3fs' % frame_age_sec,
-            max_age, freshness),
-         (0, 255, 0) if fresh else (0, 0, 255)),
-        ('ROI x=%.2f..%.2f  y=%.2f..%.2f' % (
+            max_age, freshness), (0, 255, 0) if fresh else (0, 0, 255)),
+        ('ROI x=%.2f..%.2f y=%.2f..%.2f' % (
             detector_cfg['roi_x_ratio_min'], detector_cfg['roi_x_ratio_max'],
             detector_cfg['roi_y_ratio_min'], detector_cfg['roi_y_ratio_max']),
          (0, 255, 0)),
-        ('HSV H=%d..%d S=%d..%d V=%d..%d  min area=%.0f r=%.1f circ=%.2f' % (
+        ('HSV H=%d..%d S=%d..%d V=%d..%d  morph open=%d close=%d' % (
             detector_cfg['h_min'], detector_cfg['h_max'],
             detector_cfg['s_min'], detector_cfg['s_max'],
             detector_cfg['v_min'], detector_cfg['v_max'],
-            detector_cfg['min_area'], detector_cfg['min_radius'],
-            detector_cfg['min_circularity']),
+            detector_cfg['open_kernel'], detector_cfg['close_kernel']),
          (255, 100, 0)),
-        ('top=%s  slow<=%.3f:%s  upright<=%.3f:%s' % (
+        ('RULE area=%.0f..%.0f radius=%.1f..%.1f circ>=%.2f wh=%.2f..%.2f' % (
+            detector_cfg['min_area'], detector_cfg['max_area'],
+            detector_cfg['min_radius'], detector_cfg['max_radius'],
+            detector_cfg['min_circularity'], detector_cfg['min_wh_ratio'],
+            detector_cfg['max_wh_ratio']), (255, 100, 0)),
+        ('top=%s slow<=%.3f:%s upright<=%.3f:%s confirm=%d/%d' % (
             '-' if top_ratio is None else '%.3f' % top_ratio,
             slow_ratio, 'YES' if slow_ok else 'NO',
-            upright_ratio, 'YES' if upright_ok else 'NO'),
-         (255, 0, 255)),
-        ('upright confirm=%d/%d  trigger=%s' % (
-            trigger_count, confirm_frames,
-            'YES' if trigger_count >= confirm_frames else 'NO'),
-         (0, 0, 255) if trigger_count >= confirm_frames else (0, 255, 255)),
+            upright_ratio, 'YES' if upright_ok else 'NO',
+            trigger_count, confirm_frames), (255, 0, 255)),
     ]
-    if det is None:
-        lines.append(('basketball=not detected', (180, 180, 180)))
+    if detail is None:
+        lines.append(('NO HSV CONTOUR above debug-display floor', (0, 0, 255)))
     else:
         lines.append((
-            'area=%.0fpx2 ratio=%.5f radius=%.1fpx circularity=%.3f' % (
-                float(det.extra.get('area', 0.0)),
-                float(det.extra.get('area_ratio', 0.0)),
-                float(det.extra.get('radius', 0.0)),
-                float(det.extra.get('circularity', 0.0))),
-            (255, 100, 0),
-        ))
+            'BEST %s score=%.1f' % ('PASS' if detail['accepted'] else 'FAIL',
+                                    detail['score']),
+            (0, 220, 0) if detail['accepted'] else (0, 0, 255)))
+        for item in detail['checks']:
+            lines.append((
+                '%s %-12s value=%s rule:%s' % (
+                    '+' if item['passed'] else '-', item['name'],
+                    item['value'], item['rule']),
+                (60, 230, 60) if item['passed'] else (60, 60, 255)))
     return _append_status_panel(
-        view, 'AI BASKETBALL (top edge: smaller ratio = higher in image)',
-        lines, 185)
+        view, 'AI BASKETBALL: GREEN=PASS RED=REJECTED', lines,
+        max(250, 48 + 18 * len(lines)))
 
 
 def _draw_detection(image, det, color, label, depth_m):
@@ -1216,7 +1357,7 @@ def _cola_debug_view(frame, cfg, selected):
     if detail is None and visible:
         detail = visible[0]
     panel_width = min(max(290, int(view.shape[1] * 0.48)), view.shape[1] - 10)
-    panel_height = min(view.shape[0] - 10, 32 + 15 * 14)
+    panel_height = min(view.shape[0] - 10, 68 + 15 * 14)
     overlay = view.copy()
     cv2.rectangle(overlay, (5, 5), (5 + panel_width, 5 + panel_height),
                   (8, 12, 18), -1)
@@ -1229,9 +1370,22 @@ def _cola_debug_view(frame, cfg, selected):
         mode_text = 'CAP + DARK BODY'
     _put_label(view, 'GREEN=PASS  RED=FAIL  %s' % mode_text,
                (12, 23), (255, 255, 255), 0.40)
+    _put_label(view,
+               'CAP HSV H=0..%d or %d..179 S>=%d V>=%d area_ratio=%.5f..%.5f' % (
+                   cfg['cap_h_low_max'], cfg['cap_h_high_min'], cfg['cap_s_min'],
+                   cfg['cap_v_min'], cfg['cap_min_area_ratio'],
+                   cfg['cap_max_area_ratio']),
+               (12, 42), (120, 180, 255), 0.30)
+    _put_label(view,
+               'CAP aspect=%.2f..%.2f body area>=%g size>=%dx%d bottle aspect=%.2f..%.2f' % (
+                   cfg['cap_min_aspect'], cfg['cap_max_aspect'],
+                   cfg['cap_body_min_area'], cfg['cap_body_min_width'],
+                   cfg['cap_body_min_height'], cfg['cap_bottle_min_aspect'],
+                   cfg['cap_bottle_max_aspect']),
+               (12, 58), (120, 180, 255), 0.29)
     if detail is None:
         _put_label(view, 'NO VISIBLE COLA CANDIDATE',
-                   (12, 48), (0, 165, 255), 0.55)
+                   (12, 82), (0, 165, 255), 0.55)
     else:
         title_color = (0, 220, 0) if detail['accepted'] else (0, 0, 255)
         selection_suffix = ''
@@ -1248,8 +1402,8 @@ def _cola_debug_view(frame, cfg, selected):
             detail.get('id', '?'),
             'PASS' if detail['accepted'] else 'FAIL', detail['score'],
             selection_suffix),
-            (12, 46), title_color, 0.50)
-        line_y = 66
+            (12, 82), title_color, 0.50)
+        line_y = 102
         for entry in detail['checks'][:13]:
             mark = '+' if entry['passed'] else '-'
             color = (80, 230, 80) if entry['passed'] else (80, 80, 255)
@@ -1805,6 +1959,7 @@ class Stage4VisionPreviewNode(Node):
             ai_age_sec,
             self.basketball_trigger_count,
         )
+        masks_view = _mask_mosaic(frame, self.configs)
 
         bar_obstacle_view = frame.copy()
         targets_view = frame.copy()
@@ -1934,6 +2089,8 @@ class Stage4VisionPreviewNode(Node):
                 basketball_ai_view, self.args.jpeg_quality),
             'cola_debug': _encode_jpeg(
                 cola_debug_view, self.args.jpeg_quality),
+            'masks': _encode_jpeg(
+                masks_view, self.args.jpeg_quality),
             'yellow': _encode_jpeg(yellow_view, self.args.jpeg_quality),
         }
         rgb_shape = '%dx%d %s' % (rgb_msg.width, rgb_msg.height, rgb_msg.encoding)
