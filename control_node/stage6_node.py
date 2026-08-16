@@ -1,86 +1,87 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os
-os.environ['QT_X11_NO_MITSHM'] = '1'
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
-from rclpy.parameter import Parameter
-from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
-import time
+"""第六赛段节点：把足球推出出口区域，到达终点圆圈并趴下。
+
+原 control_node_123456.py 的 SixthStageMixin（状态机与视觉逻辑原样搬移）。
+MISSION_COMPLETE 持续发送趴下命令 p6_mission_complete_grace_sec 秒后，
+向任务控制节点上报完成。
+"""
+
 import math
-import threading
-import sys
 import traceback
+
 import cv2
 import numpy as np
 
-# 导入底层 LCM 消息 (请确保路径正确)
-sys.path.append('/home/cyberdog_sim/loco_hl_example/basic_motion')
-try:
-    from robot_control_cmd_lcmt import robot_control_cmd_lcmt
-    from robot_control_response_lcmt import robot_control_response_lcmt
-except ImportError:
-    print("⚠️ 找不到 LCM 文件，请检查 sys.path 路径！")
+import rclpy
+from sensor_msgs.msg import Image
 
-from cyberdog_msg.msg import YamlParam
+from control_node.robot_control_cmd_lcmt import robot_control_cmd_lcmt
+from control_node.stage_common import StageNodeBase
 
-class ControlParameterValueKind:
-    kVEC_X_DOUBLE = 3
 
-class LcmController:
+class Stage6Node(StageNodeBase):
+
+    STAGE_ID = 6
+
     def __init__(self):
-        import lcm
-        self.lc_r = lcm.LCM("udpm://239.255.76.67:7670?ttl=255")
-        self.lc_s = lcm.LCM("udpm://239.255.76.67:7671?ttl=255")
-        self.cmd_msg = robot_control_cmd_lcmt()
-        self.rec_msg = robot_control_response_lcmt()
-        self.send_lock = threading.Lock()
-        self.delay_cnt = 0
-        self.running = True
+        super().__init__('stage6_node', self.STAGE_ID)
+        # MISSION_COMPLETE（趴下）持续多久后向任务控制节点上报完成。
+        self.declare_parameter('p6_mission_complete_grace_sec', 3.0)
+        self.p6_mission_complete_grace_sec = float(
+            self.get_parameter('p6_mission_complete_grace_sec').value)
+        # 真机分步调试：只执行“北向接近黄线 -> 原地校准 -> 保持停车”。
+        # 默认关闭，避免改变正式比赛状态机；由专用参数文件显式开启。
+        self.declare_parameter('p6_north_align_test_only', False)
+        self.declare_parameter('p6_north_test_vx', 0.10)
+        self.declare_parameter('p6_north_test_stop_dist_m', 0.80)
+        self.declare_parameter('p6_north_test_align_tolerance_deg', 4.0)
+        self.declare_parameter('p6_north_test_timeout_s', 8.0)
+        self.declare_parameter('p6_wall_roi_y_min_ratio', 0.70)
+        self.declare_parameter('p6_north_test_stop_y_ratio', 0.68)
+        self.declare_parameter('p6_north_test_align_max_wz', 0.15)
+        self.p6_north_align_test_only = bool(
+            self.get_parameter('p6_north_align_test_only').value)
+        self.p6_north_test_vx = float(
+            self.get_parameter('p6_north_test_vx').value)
+        self.p6_north_test_stop_dist_m = float(
+            self.get_parameter('p6_north_test_stop_dist_m').value)
+        self.p6_north_test_align_tolerance_deg = float(
+            self.get_parameter('p6_north_test_align_tolerance_deg').value)
+        self.p6_north_test_timeout_s = float(
+            self.get_parameter('p6_north_test_timeout_s').value)
+        self.p6_wall_roi_y_min_ratio = float(
+            self.get_parameter('p6_wall_roi_y_min_ratio').value)
+        self.p6_north_test_stop_y_ratio = float(
+            self.get_parameter('p6_north_test_stop_y_ratio').value)
+        self.p6_north_test_align_max_wz = float(
+            self.get_parameter('p6_north_test_align_max_wz').value)
+        self.sixth_stage_init()
+        # 原代码 show_vision 恒为 True；拆分后跟随 show_debug_vis 参数。
+        self.show_vision = bool(self.show_debug_vis)
+        self._mission_complete_since = None
 
-        self.rec_thread = threading.Thread(target=self.rec_response, daemon=True)
-        self.send_thread = threading.Thread(target=self.send_publish, daemon=True)
-        self.rec_thread.start()
-        self.send_thread.start()
+    def handle_rgb_msg(self, msg: Image):
+        # P6 视觉直接消费原始图像消息（原 rgb_callback 的 P6 分支）。
+        self.p6_image_callback(msg)
 
-    def msg_handler(self, channel, data):
-        self.rec_msg = robot_control_response_lcmt().decode(data)
+    def on_activated(self):
+        self._mission_complete_since = None
+        self.enter_sixth_stage('mission control activation')
+        self.p6_behavior_loop()
 
-    def rec_response(self):
-        self.lc_r.subscribe("robot_control_response", self.msg_handler)
-        while self.running:
-            self.lc_r.handle()
-            time.sleep(0.002)
+    def stage_control_loop(self):
+        self.p6_control_loop()
+        if self.state == 'MISSION_COMPLETE':
+            now = self.now_sec()
+            if self._mission_complete_since is None:
+                self._mission_complete_since = now
+            elif now - self._mission_complete_since >= self.p6_mission_complete_grace_sec:
+                self.complete_stage('MISSION_COMPLETE (lie-down grace elapsed)')
 
-    def send_publish(self):
-        while self.running:
-            with self.send_lock:
-                if self.delay_cnt > 20: 
-                    self.lc_s.publish("robot_control_cmd", self.cmd_msg.encode())
-                    self.delay_cnt = 0
-                self.delay_cnt += 1
-            time.sleep(0.005)
-
-    def send_cmd(self, msg):
-        with self.send_lock:
-            self.delay_cnt = 50
-            self.cmd_msg = msg
-
-    def quit(self):
-        self.running = False
-        self.rec_thread.join()
-        self.send_thread.join()
-
-class SneakController(Node):
-    def __init__(self, controller: LcmController):
-        super().__init__('sneak_controller')
-        self.controller = controller
+    def sixth_stage_init(self):
         # 👇👇👇 [核心修改]：强制当前节点使用 Gazebo 的仿真时间
-        self.set_parameters([Parameter('use_sim_time', Parameter.Type.BOOL, True)])
         # 👆👆👆 
-        self.yaml_pub = self.create_publisher(YamlParam, "yaml_parameter", 10)
         
         # ========================================================
         # 👑 战术调参区 (重点关注这里)
@@ -144,17 +145,17 @@ class SneakController(Node):
         self.life_count_val = 0
         self.wall_angle_rad = 0.0
         self.wall_dist = -1.0
+        self.wall_center_y_norm = -1.0
 
         # ========================================================
         # 视觉模块整合区：原 ball_vision_tracker + wall_vision_tracker
         # 不再发布/订阅 /vision/ball_info、/vision/wall_info、/vision/exit_info，
         # 直接在同一个节点内更新 self.ball_* / self.wall_* / self.exit_*。
         # ========================================================
-        self.bridge = CvBridge()
-        self.latest_depth = None
 
         self.wall_angle_rad = 0.0
         self.wall_dist = -1.0
+        self.wall_center_y_norm = -1.0
 
         self.ball_offset_x = -999.0
         self.ball_dist = -1.0
@@ -166,26 +167,142 @@ class SneakController(Node):
         self.vision_window_name = 'Sixth Stage Integrated Vision'
         self.vision_window_ready = False
 
-        self.create_subscription(Image, '/rgb_camera/rgb_camera/image_raw', self.image_callback, qos_profile_sensor_data)
-        self.create_subscription(Image, '/d435/depth/d435_depth/depth/image_raw', self.depth_callback, qos_profile_sensor_data)
 
-        self.timer = self.create_timer(0.1, self.behavior_loop) # 10Hz
         
         # 将初始状态设为盲走
-        self.state = 'BLIND_MARCH' 
         self.state_ticks = 0
         self.stable_counter = 0
-        
-        self.set_dynamic_shape(target_height=0.25, leg_offset=0.04)
-        self.get_logger().info("=== 战术启动：幽灵潜入 ===")
+        # 进入状态时记录 ROS clock 时间；use_sim_time=True 时这里就是 Gazebo 仿真时间。
+        self.p6_state_start_time = self.now_sec()
+        self.eastward_vy_done_logged = False
+        self.ball_lost_start_time = None
+        self.exit_lost_start_time = None
 
-    def publish_yaml_vecxd(self, name: str, values):
-        msg = YamlParam()
-        msg.name = name
-        msg.kind = ControlParameterValueKind.kVEC_X_DOUBLE
-        msg.vecxd_value = [float(v) for v in values]
-        msg.is_user = 1
-        self.yaml_pub.publish(msg)
+        # 第六赛段状态集合与调试入口。注意：这些必须在 sixth_stage_init() 里执行，
+        # 不能放到 now_sec() 的 return 后面，否则 P6 状态分发和直接调试入口会失效。
+        self.p6_states = {
+            'P6_START',
+            'BLIND_MARCH', 'NORTHWARD_MARCH', 'FINAL_ALIGN', 'OPEN_LOOP_TURN',
+            'SHRINK_LEGS', 'EASTWARD_MARCH', 'CLEAR_BALL_TURN', 'BUFFER_CRAB',
+            'LOWER_BODY_FOR_CRAB', 'CLEAR_BALL_CRAB', 'RESTORE_POSTURE',
+            'TURN_TO_WEST_WALL', 'WESTWARD_VISUAL_MARCH', 'ALIGN_WEST_WALL',
+            'TURN_TO_EXIT', 'LOWER_BODY_FINAL', 'PUSH_TO_EXIT',
+            'CROSS_FINISH_LINE', 'MISSION_COMPLETE', 'P6_TEST_HOLD',
+        }
+        self.p6_initial_state = (
+            'NORTHWARD_MARCH'
+            if self.p6_north_align_test_only else 'BLIND_MARCH')
+        self.p6_control_period_s = 0.10
+        self.p6_last_control_time = None
+        self.p6_state_start_time = self.now_sec()
+        self.get_logger().info('[SixthStageMixin] ready: states=P6_START/BLIND_MARCH/...')
+        if self.p6_north_align_test_only:
+            self.get_logger().warn(
+                '[P6 TEST] north-align-only enabled: '
+                f'vx={self.p6_north_test_vx:.2f}m/s, '
+                f'stop={self.p6_north_test_stop_dist_m:.2f}m, '
+                f'tolerance={self.p6_north_test_align_tolerance_deg:.1f}deg, '
+                f'timeout={self.p6_north_test_timeout_s:.1f}s')
+        
+
+    def is_sixth_stage_state(self, state: str) -> bool:
+        return isinstance(state, str) and state in getattr(self, 'p6_states', set())
+
+    def enter_sixth_stage(self, reason: str = ''):
+        self.get_logger().info(f'[HANDOFF] P5 -> P6: {reason}')
+
+        # 进入第六赛段时，必须把 P6 自己的视觉缓存、状态计时和限速计时全部清掉。
+        # 否则 P5_DONE 后第一次进入 BLIND_MARCH 时，可能沿用旧的 p6_state_start_time，
+        # 导致 blind_march_time_s 被瞬间判定为完成。
+        self.clear_pre_sixth_vision_caches()
+        self.p6_last_control_time = None
+        self.p6_force_zero_elapsed_once = True
+
+        # 先恢复第六赛段默认机身参数，再进入 BLIND_MARCH。
+        # p6_set_state 内部会记录当前 Gazebo 仿真时间作为状态起点。
+        self.set_dynamic_shape(target_height=0.25, leg_offset=0.04)
+        self.p6_set_state(self.p6_initial_state)
+        self.get_logger().info('=== 第六赛段启动：幽灵潜入 ===')
+
+    def clear_pre_sixth_vision_caches(self):
+        self.wall_angle_rad = 0.0
+        self.wall_dist = -1.0
+        self.wall_center_y_norm = -1.0
+        self.ball_offset_x = -999.0
+        self.ball_dist = -1.0
+        self.exit_offset_norm = -999.0
+        self.exit_dist = -1.0
+        self.stable_counter = 0
+        self.ball_lost_start_time = None
+        self.exit_lost_start_time = None
+        self.eastward_vy_done_logged = False
+        self.has_seen_exit = False
+        self.exit_lost_ticks = 0
+        self.ball_lost_ticks = 0
+
+    def p6_send_cmd(self, msg):
+        self.Ctrl.Send_cmd(msg)
+        # Robot_Ctrl may advance the very first command once more to guarantee
+        # that its life_count differs from the previous stage.
+        self.life_count_val = int(msg.life_count)
+
+    def p6_set_state(self, new_state: str):
+        """第六赛段统一切换状态：清 tick，并记录进入状态的仿真时间。"""
+        old_state = getattr(self, 'state', None)
+        now = self.now_sec()
+
+        self.state = new_state
+        self.state_ticks = 0
+        self.stable_counter = 0
+
+        # 记录当前 Gazebo /clock 时间作为新状态起点。
+        # 同时要求下一次 state_elapsed_s() 强制返回 0，避免刚切状态的同一轮回调
+        # 由于旧时间戳/阻塞等待造成 elapsed 异常偏大。
+        self.p6_state_start_time = now
+        self.p6_force_zero_elapsed_once = True
+        self.p6_last_control_time = None
+
+        if new_state == 'EASTWARD_MARCH':
+            self.eastward_vy_done_logged = False
+            self.ball_lost_ticks = 0
+            self.ball_lost_start_time = None
+        if new_state == 'PUSH_TO_EXIT':
+            self.has_seen_exit = False
+            self.exit_lost_ticks = 0
+            self.exit_lost_start_time = None
+
+        self.get_logger().info(f'[P6] ENTER STATE: {old_state} -> {new_state}, sim_time={now:.3f}')
+
+    def p6_state_elapsed_s(self) -> float:
+        """第六赛段当前状态已经持续的仿真时间。"""
+        now = self.now_sec()
+
+        if not hasattr(self, 'p6_state_start_time') or self.p6_state_start_time is None:
+            self.p6_state_start_time = now
+            self.p6_force_zero_elapsed_once = False
+            return 0.0
+
+        # 刚进入新状态后的第一轮控制强制认为 elapsed=0。
+        # 这样 P5_DONE -> P6 的交接不会把 BLIND_MARCH 直接跳过。
+        if getattr(self, 'p6_force_zero_elapsed_once', False):
+            self.p6_force_zero_elapsed_once = False
+            self.p6_state_start_time = now
+            return 0.0
+
+        self.p6_state_start_time = self.align_motion_timer_start(
+            self.p6_state_start_time, now)
+        elapsed = now - self.p6_state_start_time
+        if elapsed < 0.0:
+            self.p6_state_start_time = now
+            return 0.0
+        return elapsed
+
+    def p6_control_loop(self):
+        now = self.now_sec()
+        if self.p6_last_control_time is not None and (now - self.p6_last_control_time) < self.p6_control_period_s:
+            return
+        self.p6_last_control_time = now
+        self.p6_behavior_loop()
 
     def set_dynamic_shape(self, target_height: float, leg_offset: float):
         values_h = [0.0] * 12
@@ -201,11 +318,6 @@ class SneakController(Node):
         self.publish_yaml_vecxd("y_offset_trot", values_y)
         self.publish_yaml_vecxd("y_offset_trot_10_4", values_y)
 
-    def depth_callback(self, msg: Image):
-        try:
-            self.latest_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-        except Exception:
-            self.get_logger().warn('Depth image convert failed', throttle_duration_sec=1.0)
 
     def _median_depth_m(self, cx, cy, patch_radius=5, max_depth=5.0):
         """从深度图局部 patch 取中位数，返回米；无效时返回 -1.0。"""
@@ -227,6 +339,7 @@ class SneakController(Node):
             return -1.0
         return float(np.median(valid))
 
+
     def _update_wall_vision(self, cv_image, hsv):
         """整合 wall_vision_tracker：检测最近内墙，更新 wall_angle_rad / wall_dist。"""
         height, width = cv_image.shape[:2]
@@ -238,7 +351,7 @@ class SneakController(Node):
         # 原 wall_vision_tracker 的 ROI：只看画面中下部，减少选到远处墙线。
         roi_x_min = int(width * 0.20)
         roi_x_max = int(width * 0.80)
-        roi_y_min = int(height * 0.70)
+        roi_y_min = int(height * self.p6_wall_roi_y_min_ratio)
         roi_y_max = height
 
         mask[:roi_y_min, :] = 0
@@ -307,6 +420,7 @@ class SneakController(Node):
         real_dist = self._median_depth_m(center_x, center_y, patch_radius=5, max_depth=5.0)
         self.wall_angle_rad = float(angle_rad)
         self.wall_dist = float(real_dist)
+        self.wall_center_y_norm = float(center_y) / float(max(1, height))
 
         if real_dist > 0:
             cv2.putText(cv_image, f'WALL Dist:{real_dist:.2f}m ANG:{math.degrees(angle_rad):.1f}deg',
@@ -314,6 +428,7 @@ class SneakController(Node):
         else:
             cv2.putText(cv_image, 'WALL DEPTH INVALID', (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
 
     def _update_exit_vision(self, cv_image, hsv):
         """整合 ball_vision_tracker 的出口检测：检测黄色墙壁断口，更新 exit_offset_norm / exit_dist。"""
@@ -400,6 +515,7 @@ class SneakController(Node):
             cv2.putText(cv_image, f'EXIT off:{self.exit_offset_norm:.2f} depth invalid',
                         (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
+
     def _update_ball_vision(self, cv_image, hsv):
         """整合 ball_vision_tracker 的白球检测，更新 ball_offset_x / ball_dist。"""
         height, width = cv_image.shape[:2]
@@ -443,7 +559,8 @@ class SneakController(Node):
             cv2.putText(cv_image, f'BALL off:{self.ball_offset_x:.2f} depth invalid',
                         (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-    def image_callback(self, msg: Image):
+
+    def p6_image_callback(self, msg: Image):
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
@@ -470,6 +587,7 @@ class SneakController(Node):
         except Exception:
             self.get_logger().error(f'Integrated vision failed:\n{traceback.format_exc()}')
 
+
     def destroy_vision_windows(self):
         try:
             if self.vision_window_ready:
@@ -478,14 +596,21 @@ class SneakController(Node):
         except Exception:
             pass
 
-    def behavior_loop(self):
-        self.life_count_val = (self.life_count_val + 1) % 128
+
+    def p6_behavior_loop(self):
+        if self.state == 'P6_START':
+            self.p6_set_state(self.p6_initial_state)
+            return
+        self.life_count_val += 1
+        if self.life_count_val > 127:
+            self.life_count_val = 1
         msg = robot_control_cmd_lcmt()
         msg.life_count = self.life_count_val
         msg.duration = 0 
         msg.pos_des = [0.0, 0.0, 0.0]
         msg.rpy_des = [0.0, 0.0, 0.0]
         self.state_ticks += 1
+        state_elapsed = self.p6_state_elapsed_s()
 
         wall_visible = (self.wall_dist != -1.0)
       
@@ -496,15 +621,20 @@ class SneakController(Node):
             msg.mode = 11
             msg.gait_id = 3 
             msg.step_height = [0.05, 0.05] 
+
+            if self.state_ticks == 1 or self.state_ticks % 10 == 0:
+                self.get_logger().info(
+                    f"[P6_BLIND_MARCH] elapsed={state_elapsed:.3f}/{self.blind_march_time_s:.3f}s, "
+                    f"cmd=(0.500,0.000,0.000)"
+                )
             
-            if self.state_ticks >= int(self.blind_march_time_s * 10):
+            if state_elapsed >= self.blind_march_time_s:
                 self.get_logger().info("🦯 盲走结束，开启视觉雷达看北墙！")
-                self.state = 'NORTHWARD_MARCH'
-                self.state_ticks = 0
+                self.p6_set_state('NORTHWARD_MARCH')
                 return
                 
             msg.vel_des = [0.5, 0.0, 0.0]
-            self.controller.send_cmd(msg)
+            self.p6_send_cmd(msg)
 
         # ==========================================
         # 1. 视觉北伐阶段
@@ -514,30 +644,52 @@ class SneakController(Node):
             msg.gait_id = 3 
             msg.step_height = [0.05, 0.05] 
             
-            vx = 0.5 
+            vx = (
+                self.p6_north_test_vx
+                if self.p6_north_align_test_only else 0.5)
             vyaw = 0.0 
+            stop_dist_m = (
+                self.p6_north_test_stop_dist_m
+                if self.p6_north_align_test_only else self.north_stop_dist_m)
+
+            # 黄线/深度始终不可用时不能无限向前。测试模式到时立即保持停车。
+            if (self.p6_north_align_test_only and
+                    state_elapsed >= self.p6_north_test_timeout_s):
+                self.get_logger().error(
+                    '[P6 TEST] north approach timeout; holding STOP')
+                msg.vel_des = [0.0, 0.0, 0.0]
+                self.p6_send_cmd(msg)
+                self.p6_set_state('P6_TEST_HOLD')
+                return
             
             if wall_visible:
                 # 边走边粗调朝向
                 vyaw = - (self.wall_angle_rad * 0.8) 
                 vyaw = max(min(vyaw, 0.3), -0.3)
                 
-                if 0.0 < self.wall_dist < self.north_stop_dist_m:
+                reached_stop = (
+                    self.wall_center_y_norm >= self.p6_north_test_stop_y_ratio
+                    if self.p6_north_align_test_only
+                    else 0.0 < self.wall_dist < stop_dist_m)
+                if reached_stop:
                     self.stable_counter += 1
                     if self.stable_counter >= 2:
-                        self.get_logger().info(f"🎯 抵达极近距离 ({self.wall_dist:.2f}m)！停车准备原地垂直校准。")
-                        self.state = 'FINAL_ALIGN'
+                        self.get_logger().info(
+                            f'🎯 黄线到达停车位置 '
+                            f'(y={self.wall_center_y_norm:.3f}, depth={self.wall_dist:.2f}m)'
+                            '！停车准备原地校准。')
+                        self.p6_set_state('FINAL_ALIGN')
                         self.state_ticks = 0
                         self.stable_counter = 0
                        
                         msg.vel_des = [0.0, 0.0, 0.0]
-                        
+                        self.p6_send_cmd(msg)
                         return
                 else:
                     self.stable_counter = 0
                 
             msg.vel_des = [vx, 0.0, vyaw]
-            self.controller.send_cmd(msg)
+            self.p6_send_cmd(msg)
 
         # ==========================================
         # 2. 原地绝对垂直校准
@@ -551,11 +703,23 @@ class SneakController(Node):
                 angle_deg = math.degrees(self.wall_angle_rad)
                 
                 # 对齐了！进入开环参数自转
-                if abs(angle_deg) < self.align_tolerance_deg:
+                align_tolerance_deg = (
+                    self.p6_north_test_align_tolerance_deg
+                    if self.p6_north_align_test_only
+                    else self.align_tolerance_deg)
+                if abs(angle_deg) < align_tolerance_deg:
                     self.stable_counter += 1
                     if self.stable_counter >= 3:
-                        self.get_logger().info(f"📐 北墙已绝对垂直 (偏角: {angle_deg:.1f}度)，开始自转90度！")
-                        self.state = 'OPEN_LOOP_TURN'
+                        if self.p6_north_align_test_only:
+                            self.get_logger().info(
+                                f'[P6 TEST] north alignment complete '
+                                f'(angle={angle_deg:.1f}deg); holding STOP')
+                            msg.vel_des = [0.0, 0.0, 0.0]
+                            self.p6_send_cmd(msg)
+                            self.p6_set_state('P6_TEST_HOLD')
+                        else:
+                            self.get_logger().info(f"📐 北墙已绝对垂直 (偏角: {angle_deg:.1f}度)，开始自转90度！")
+                            self.p6_set_state('OPEN_LOOP_TURN')
                         self.state_ticks = 0
                         self.stable_counter = 0
                         
@@ -565,18 +729,37 @@ class SneakController(Node):
                     
                 # 原地强扭
                 vyaw = - (self.wall_angle_rad * 1.5)
-                vyaw = max(min(vyaw, 0.4), -0.4)
+                max_align_wz = (
+                    self.p6_north_test_align_max_wz
+                    if self.p6_north_align_test_only else 0.4)
+                vyaw = max(min(vyaw, max_align_wz), -max_align_wz)
                 msg.vel_des = [0.0, 0.0, vyaw]
             else:
                 msg.vel_des = [0.0, 0.0, 0.0]
                 
             # 超时保护(最多对齐3秒)
-            if self.state_ticks > 35:
-                self.get_logger().warn("⚠️ 校准超时，强制进入转身！")
-                self.state = 'OPEN_LOOP_TURN'
+            if state_elapsed > 3.5:
+                if self.p6_north_align_test_only:
+                    self.get_logger().warn(
+                        '[P6 TEST] alignment timeout; holding STOP')
+                    msg.vel_des = [0.0, 0.0, 0.0]
+                    self.p6_set_state('P6_TEST_HOLD')
+                else:
+                    self.get_logger().warn("⚠️ 校准超时，强制进入转身！")
+                    self.p6_set_state('OPEN_LOOP_TURN')
                 self.state_ticks = 0
                 
-            self.controller.send_cmd(msg)
+            self.p6_send_cmd(msg)
+
+        # ==========================================
+        # 真机北向校准测试终点：持续零速度，绝不进入后续赛段动作
+        # ==========================================
+        elif self.state == 'P6_TEST_HOLD':
+            msg.mode = 11
+            msg.gait_id = 3
+            msg.step_height = [0.04, 0.04]
+            msg.vel_des = [0.0, 0.0, 0.0]
+            self.p6_send_cmd(msg)
 
         # ==========================================
         # 3. 参数开环转身 (调参区在上面)
@@ -586,15 +769,15 @@ class SneakController(Node):
             msg.gait_id = 3
             msg.step_height = [0.04, 0.04]
             
-            if self.state_ticks >= int(self.turn_time_s * 10):
+            if state_elapsed >= self.turn_time_s:
                 self.get_logger().info("✅ 参数转向结束！准备收腿！")
-                self.state = 'SHRINK_LEGS'
+                self.p6_set_state('SHRINK_LEGS')
                 self.state_ticks = 0
                 
                 return
                 
             msg.vel_des = [0.0, 0.0, self.turn_vyaw]
-            self.controller.send_cmd(msg)
+            self.p6_send_cmd(msg)
 
         # ==========================================
         # 4. 收腿成刀片形态
@@ -605,11 +788,11 @@ class SneakController(Node):
             
             msg.mode = 11
             msg.gait_id = 0
-            self.controller.send_cmd(msg)
+            self.p6_send_cmd(msg)
             
-            if self.state_ticks > 15: 
+            if state_elapsed > 1.5: 
                 self.get_logger().info("🔪 刀片形态就绪！向东进发！")
-                self.state = 'EASTWARD_MARCH'
+                self.p6_set_state('EASTWARD_MARCH')
                 self.state_ticks = 0
 
        # ==========================================
@@ -629,11 +812,12 @@ class SneakController(Node):
             # 🟢 独立控制轴 A：北向横移 (vy) —— 纯靠绝对时间，与球无关！
             # ---------------------------------------------------------
             # 只要当前状态的总时间没达到您设定的横移时间，就一直往北挤
-            if self.state_ticks < int(self.eastward_vy_time_s * 10):
+            if state_elapsed < self.eastward_vy_time_s:
                 vy = self.eastward_vy
             else:
-                if self.state_ticks == int(self.eastward_vy_time_s * 10):
+                if not getattr(self, 'eastward_vy_done_logged', False):
                     self.get_logger().info("🛑 北向横移时间到！已贴紧北墙，停止横移！")
+                    self.eastward_vy_done_logged = True
                 vy = 0.0  # 时间一到，无论看不看得见球，北向移动绝对归零！
                 
             # ---------------------------------------------------------
@@ -644,28 +828,35 @@ class SneakController(Node):
             ball_visible = (self.ball_dist != -1.0)
             
             if ball_visible:
-                # 能看见球，说明在东向上还没绕过去，盲走倒计时死死压在0
+                # 能看见球，说明在东向上还没绕过去，盲走倒计时清零
                 self.ball_lost_ticks = 0
+                self.ball_lost_start_time = None
             else:
-                # 球从视野边缘滑出消失（说明东向已经越过了球），开始累计东向的盲走时间！
+                # 球从视野边缘滑出消失，记录消失开始的仿真时间
                 self.ball_lost_ticks += 1
+                if self.ball_lost_start_time is None:
+                    self.ball_lost_start_time = self.now_sec()
+
+            ball_lost_elapsed = 0.0
+            if self.ball_lost_start_time is not None:
+                ball_lost_elapsed = self.now_sec() - self.ball_lost_start_time
             
-            # 【东向的最终停止条件】：越过球之后，往东盲走的时间达到了您的设定值
-            if self.ball_lost_ticks >= int(self.eastward_blind_after_lost_s * 10):
-                self.get_logger().info(f"🏁 成功绕过球！东向盲走 {self.eastward_blind_after_lost_s}s 结束！完美抵达死角准备解围！")
-                self.state = 'CLEAR_BALL_TURN' 
+            # 【东向的最终停止条件】：越过球之后，往东盲走的仿真时间达到了设定值
+            if ball_lost_elapsed >= self.eastward_blind_after_lost_s:
+                self.get_logger().info(f"🏁 成功绕过球！东向盲走 {ball_lost_elapsed:.3f}/{self.eastward_blind_after_lost_s:.3f}s 结束！完美抵达死角准备解围！")
+                self.p6_set_state('CLEAR_BALL_TURN') 
                 self.state_ticks = 0
                 return
                 
             # 超时绝对保底（防止意外卡死）
-            if self.state_ticks >= int(self.eastward_timeout_s * 10):
+            if state_elapsed >= self.eastward_timeout_s:
                 self.get_logger().warn("⚠️ 东征潜入超时保底触发！强制进入解围！")
-                self.state = 'CLEAR_BALL_TURN'
+                self.p6_set_state('CLEAR_BALL_TURN')
                 self.state_ticks = 0
                 return
             
             msg.vel_des = [vx, vy, vyaw] 
-            self.controller.send_cmd(msg)
+            self.p6_send_cmd(msg)
 
 # ==========================================
         # 6. 解围第一步：轻微自转兜球
@@ -675,16 +866,16 @@ class SneakController(Node):
             msg.gait_id = 3
             msg.step_height = [0.04, 0.04]
             
-            if self.state_ticks >= int(self.clear_turn_time_s * 10):
+            if state_elapsed >= self.clear_turn_time_s:
                 self.get_logger().info("🔄 兜球自转结束！开始加速右侧螃蟹步解围！")
-                self.state = 'BUFFER_CRAB'
+                self.p6_set_state('BUFFER_CRAB')
                 self.state_ticks = 0
                 msg.mode = 11
-                self.controller.send_cmd(msg)
+                self.p6_send_cmd(msg)
                 return
                 
             msg.vel_des = [0.0, 0.0, self.clear_turn_vyaw]
-            self.controller.send_cmd(msg)
+            self.p6_send_cmd(msg)
 
         # ==========================================
         # 6.2. 插入新阶段：极慢速横移，腾出降底盘空间
@@ -694,17 +885,17 @@ class SneakController(Node):
             msg.gait_id = 3
             msg.step_height = [0.03, 0.03]
             
-            if self.state_ticks >= int(self.buffer_crab_time_s * 10):
+            if state_elapsed >= self.buffer_crab_time_s:
                 self.get_logger().info("🛡️ 缓冲空间已拉开，准备降低底盘贴地推球！")
-                self.state = 'LOWER_BODY_FOR_CRAB'
+                self.p6_set_state('LOWER_BODY_FOR_CRAB')
                 self.state_ticks = 0
                 msg.mode = 11
-                self.controller.send_cmd(msg)
+                self.p6_send_cmd(msg)
                 return
                 
             # 注意：仅做 vy 的横移，vx 为 0
             msg.vel_des = [0.0, self.buffer_crab_vy, 0.0]
-            self.controller.send_cmd(msg)
+            self.p6_send_cmd(msg)
 
         # ==========================================
         # 6.5. 插入新阶段：极限压低底盘
@@ -716,11 +907,11 @@ class SneakController(Node):
             
             msg.mode = 11  # 保持原地站立，等待身体降下去
             msg.gait_id = 0
-            self.controller.send_cmd(msg)
+            self.p6_send_cmd(msg)
             
-            if self.state_ticks > 15: # 给物理引擎 1.5 秒的时间把身体压低
+            if state_elapsed > 1.5: # 给物理引擎 1.5 秒的时间把身体压低
                 self.get_logger().info("⬇️ 底盘已降至最低 0.14m！开启螃蟹步强力扫球！")
-                self.state = 'CLEAR_BALL_CRAB'
+                self.p6_set_state('CLEAR_BALL_CRAB')
                 self.state_ticks = 0
 
         # ==========================================
@@ -731,17 +922,17 @@ class SneakController(Node):
             msg.gait_id = 3  # 用普通 trot 步态横移，爆发力更强
             msg.step_height = [0.04, 0.04]
             
-            if self.state_ticks >= int(self.clear_crab_time_s * 10):
+            if state_elapsed >= self.clear_crab_time_s:
                 self.get_logger().info("🎉 解围完成！起立，准备找球！")
-                self.state = 'RESTORE_POSTURE'    # <--- 修改这里
+                self.p6_set_state('RESTORE_POSTURE')    # <--- 修改这里
                 self.state_ticks = 0
                 msg.mode = 11
-                self.controller.send_cmd(msg)
+                self.p6_send_cmd(msg)
                 return
                 
             # 注意：向右横移，所以 vx=0，vy 为负数
             msg.vel_des = [0.0, self.clear_crab_vy, 0.0]
-            self.controller.send_cmd(msg)
+            self.p6_send_cmd(msg)
 
     
         # ==========================================
@@ -755,11 +946,11 @@ class SneakController(Node):
             msg.gait_id = 3
             msg.step_height = [0.04, 0.04]
             msg.vel_des = [0.0, 0.0, 0.0]
-            self.controller.send_cmd(msg)
+            self.p6_send_cmd(msg)
             
-            if self.state_ticks > 25: 
+            if state_elapsed > 2.5: 
                 self.get_logger().info("🐕 姿态恢复完毕！开始开环定时转身面向西墙！")
-                self.state = 'TURN_TO_WEST_WALL'  # <--- 修改这里
+                self.p6_set_state('TURN_TO_WEST_WALL')  # <--- 修改这里
                 self.state_ticks = 0
    # ==========================================
         # 9. 转向西墙 (纯调参开环)
@@ -769,14 +960,14 @@ class SneakController(Node):
             msg.gait_id = 3
             msg.step_height = [0.04, 0.04]
             
-            if self.state_ticks >= int(self.west_turn_time_s * 10):
+            if state_elapsed >= self.west_turn_time_s:
                 self.get_logger().info("✅ 转西墙结束！开始向前盲走靠近西墙！")
-                self.state = 'WESTWARD_VISUAL_MARCH'  # <--- 修改这里：去盲走！
+                self.p6_set_state('WESTWARD_VISUAL_MARCH')  # <--- 修改这里：去盲走！
                 self.state_ticks = 0
                 return
                 
             msg.vel_des = [0.0, 0.0, self.west_turn_vyaw]
-            self.controller.send_cmd(msg)
+            self.p6_send_cmd(msg)
 
 
         # ==========================================
@@ -800,18 +991,18 @@ class SneakController(Node):
                     self.stable_counter += 1
                     if self.stable_counter >= 2:
                         self.get_logger().info(f"🎯 抵达西墙极近距离 ({self.wall_dist:.2f}m)！停车准备原地垂直校准。")
-                        self.state = 'ALIGN_WEST_WALL'
+                        self.p6_set_state('ALIGN_WEST_WALL')
                         self.state_ticks = 0
                         self.stable_counter = 0
                         msg.mode = 11 
                         msg.vel_des = [0.0, 0.0, 0.0]
-                        self.controller.send_cmd(msg)
+                        self.p6_send_cmd(msg)
                         return
                 else:
                     self.stable_counter = 0
                 
             msg.vel_des = [vx, 0.0, vyaw]
-            self.controller.send_cmd(msg)
+            self.p6_send_cmd(msg)
 
         # ==========================================
         # 10. 原地垂直校准西墙
@@ -829,11 +1020,11 @@ class SneakController(Node):
                     self.stable_counter += 1
                     if self.stable_counter >= 3:
                         self.get_logger().info(f"📐 西墙已绝对垂直 (偏角: {angle_deg:.1f}度)！开始转身面朝出口！")
-                        self.state = 'TURN_TO_EXIT'
+                        self.p6_set_state('TURN_TO_EXIT')
                         self.state_ticks = 0
                         self.stable_counter = 0
                         msg.mode = 11
-                        self.controller.send_cmd(msg)
+                        self.p6_send_cmd(msg)
                         return
                 else:
                     self.stable_counter = 0
@@ -846,12 +1037,12 @@ class SneakController(Node):
                 msg.vel_des = [0.0, 0.0, 0.0]
                 
             # 超时保护(最多对齐4秒)
-            if self.state_ticks > 35:
+            if state_elapsed > 3.5:
                 self.get_logger().warn("⚠️ 西墙校准超时，强制进入转身出口阶段！")
-                self.state = 'TURN_TO_EXIT'
+                self.p6_set_state('TURN_TO_EXIT')
                 self.state_ticks = 0
                 
-            self.controller.send_cmd(msg)
+            self.p6_send_cmd(msg)
 
         # ==========================================
         # 11. 转向出口 (纯调参开环)
@@ -861,16 +1052,16 @@ class SneakController(Node):
             msg.gait_id = 3
             msg.step_height = [0.04, 0.04]
             
-            if self.state_ticks >= int(self.exit_turn_time_s * 10):
+            if state_elapsed >= self.exit_turn_time_s:
                 self.get_logger().info("✅ 面朝出口！准备降底盘！")
-                self.state = 'LOWER_BODY_FINAL'
+                self.p6_set_state('LOWER_BODY_FINAL')
                 self.state_ticks = 0
                 msg.mode = 11
-                self.controller.send_cmd(msg)
+                self.p6_send_cmd(msg)
                 return
                 
             msg.vel_des = [0.0, 0.0, self.exit_turn_vyaw]
-            self.controller.send_cmd(msg)
+            self.p6_send_cmd(msg)
 
         # ==========================================
         # 12. 降底盘准备冲刺
@@ -883,12 +1074,12 @@ class SneakController(Node):
             msg.mode = 11
             msg.gait_id = 1
             msg.vel_des = [0.0, 0.0, 0.0]
-            self.controller.send_cmd(msg)
+            self.p6_send_cmd(msg)
             
-            if self.state_ticks > 15: # 1.5 秒丝滑降落
+            if state_elapsed > 1.5: # 1.5 秒丝滑降落
                 self.get_logger().info("🚜 最终推土机形态就绪！开启三点一线推球冲刺！")
                 # 👇 改这里：去执行三点一线推球！
-                self.state = 'PUSH_TO_EXIT'
+                self.p6_set_state('PUSH_TO_EXIT')
                 self.state_ticks = 0
 
       # ==========================================
@@ -913,7 +1104,8 @@ class SneakController(Node):
             # 【绝技 1：只要看见紫线，就死磕到底绝不停车！】
             if exit_visible:
                 self.has_seen_exit = True
-                self.exit_lost_ticks = 0  
+                self.exit_lost_ticks = 0
+                self.exit_lost_start_time = None
                 # 视觉巡线：让狗的头永远对着缺口的中心
                 vyaw = - (self.exit_offset_norm * self.push_vyaw_kp)
                 vyaw = max(min(vyaw, 0.3), -0.3) 
@@ -925,12 +1117,16 @@ class SneakController(Node):
                 # 【消失判定】：如果曾经看到过大门，现在紫线消失了，说明狗头已经穿过大门了！
                 if self.has_seen_exit:
                     self.exit_lost_ticks += 1
-                    self.get_logger().info(f"⛩️ 紫线消失！冲线判定中... ({self.exit_lost_ticks}/5)")
+                    if self.exit_lost_start_time is None:
+                        self.exit_lost_start_time = self.now_sec()
+                    exit_lost_elapsed = self.now_sec() - self.exit_lost_start_time
+                    self.get_logger().info(f"⛩️ 紫线消失！冲线判定中... elapsed={exit_lost_elapsed:.3f}/0.500s")
             
-            # 门消失 0.5 秒后确认，瞬间切换到盲走进圈状态
-            if self.exit_lost_ticks > 5:  
-                self.get_logger().info(f"⛩️ 视野已彻底越过大门！开启盲走冲线，确保进圈！")
-                self.state = 'CROSS_FINISH_LINE'
+            # 门消失 0.5 秒仿真时间后确认，瞬间切换到盲走进圈状态
+            exit_lost_elapsed = 0.0 if self.exit_lost_start_time is None else self.now_sec() - self.exit_lost_start_time
+            if self.has_seen_exit and exit_lost_elapsed >= 0.5:  
+                self.get_logger().info("⛩️ 视野已彻底越过大门！开启盲走冲线，确保进圈！")
+                self.p6_set_state('CROSS_FINISH_LINE')
                 self.state_ticks = 0
                 return
             
@@ -940,12 +1136,12 @@ class SneakController(Node):
                 vy = max(min(vy, 0.15), -0.15)   
                 
             msg.vel_des = [vx, vy, vyaw]
-            self.controller.send_cmd(msg)
+            self.p6_send_cmd(msg)
             
             # 【超时保底】如果连紫线都没看到，就推满15秒强行结束
-            if self.state_ticks > int(self.push_timeout_s * 10): 
+            if state_elapsed > self.push_timeout_s: 
                 self.get_logger().info("⏱️ 推球超时！强行闭眼冲线！")
-                self.state = 'CROSS_FINISH_LINE'
+                self.p6_set_state('CROSS_FINISH_LINE')
                 self.state_ticks = 0
 
         # ==========================================
@@ -958,11 +1154,11 @@ class SneakController(Node):
             
             # 闭着眼睛直直地往前推，不回头！
             msg.vel_des = [self.push_vx, 0.0, 0.0]
-            self.controller.send_cmd(msg)
+            self.p6_send_cmd(msg)
             
-            if self.state_ticks >= int(self.cross_line_time_s * 10):
+            if state_elapsed >= self.cross_line_time_s:
                 self.get_logger().info("🎉 四腿已进圈！完美趴下！")
-                self.state = 'MISSION_COMPLETE'
+                self.p6_set_state('MISSION_COMPLETE')
                 self.state_ticks = 0
 
         # ==========================================
@@ -972,33 +1168,40 @@ class SneakController(Node):
             msg.mode = 7 
             msg.gait_id = 1 
             msg.vel_des = [0.0, 0.0, 0.0]
-            self.controller.send_cmd(msg)
+            self.p6_send_cmd(msg)
+
+
 
 def main(args=None):
     rclpy.init(args=args)
-    controller = LcmController()
-    
-    stand_msg = robot_control_cmd_lcmt()
-    stand_msg.mode = 12 
-    stand_msg.life_count = 1
-    controller.send_cmd(stand_msg)
-    time.sleep(2.0)
-    
-    node = SneakController(controller)
-    try: rclpy.spin(node)
-    except KeyboardInterrupt: pass
+    node = Stage6Node()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
-        rest_msg = robot_control_cmd_lcmt()
-        rest_msg.mode = 7 
-        controller.send_cmd(rest_msg)
-        time.sleep(0.5)
-        controller.quit()
+        node.get_logger().info('Shutting down...')
         try:
             node.destroy_vision_windows()
         except Exception:
             pass
+        try:
+            if node.Ctrl is not None:
+                node.send_stop_command()
+        except Exception:
+            pass
+        try:
+            if node.Ctrl is not None:
+                node.Ctrl.quit()
+        except Exception:
+            pass
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

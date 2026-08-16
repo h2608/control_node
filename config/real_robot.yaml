@@ -1,0 +1,185 @@
+# Physical CyberDog common control/camera profile.
+# Camera topics below have been verified on the current robot.
+/**:
+  ros__parameters:
+    platform: real
+    use_sim_time: false
+    show_debug_vis: false
+    show_yellow_mask: false
+
+    # Stage 4 physical voice output.  Keep the topic relative so it resolves
+    # under the robot namespace supplied by launch/ROS remapping.
+    voice_backend: ros_offline
+    voice_topic: speech_play_extend
+
+    # Real cola recognition requires the visible red cap above a dark body.
+    # Do not classify unrelated dark upright objects as cola by shape alone.
+    cola.cap_only_mode: true
+    cola.enable_dark_shape: false
+    cola.cap_min_area_ratio: 0.0003
+    cola.cap_max_area_ratio: 0.01
+    cola.cap_min_aspect: 0.45
+    cola.cap_max_aspect: 2.20
+    cola.dark_v_max: 145
+    cola.dark_s_min: 20
+    cola.very_dark_v_max: 70
+    cola.close_kernel: 9
+
+    # Stage 4 physical height-limit bar is red.  h_min > h_max tells the
+    # detector to combine the two HSV red ranges: 170..179 and 0..10.
+    bar.h_min: 170
+    bar.h_max: 10
+    bar.s_min: 80
+    bar.s_max: 255
+    bar.v_min: 50
+    bar.v_max: 255
+    bar.min_area: 1000
+    # Reject isolated thin red strips while keeping the full bar frame at range.
+    bar.max_aspect_ratio: 6.0
+    bar.structure_check_enabled: true
+    bar.structure_inner_ratio: 0.40
+    bar.structure_max_inner_red_ratio: 0.35
+    bar.structure_min_depth_gap_m: 0.20
+    bar.structure_near_bypass_distance_m: 1.00
+    bar.structure_near_bypass_width_ratio: 0.40
+    bar.structure_min_depth_pixels: 10
+
+    # Stage-4 physical centering is intentionally slower than simulation.
+    # Lower minimum lateral speeds and a wider pixel deadband prevent the dog
+    # from repeatedly crossing the image center because of gait inertia.
+    global_bar_center_fixed_vy: 0.10
+    global_bar_center_px_deadband: 12
+    bar_align_vy_k: 0.22
+    bar_align_vy_max: 0.16
+    bar_align_vy_min: 0.08
+    bar_center_px_deadband: 12
+
+    # Slower physical approach under the bar and depth-controlled return.
+    # The hit motion itself is intentionally unchanged.
+    bar_search_forward_speed: 0.40
+    bar_search_near_forward_speed: 0.20
+    bar_search_slow_distance_m: 0.95
+    bar_trigger_distance_m: 0.85
+    bar_trigger_confirm_frames: 2
+    # RGB geometry replaces depth for Stage-4 approach/trigger decisions.
+    # Image y grows downward. Bars use a smaller top_y_ratio; obstacles use a
+    # larger bottom_y_ratio as they move closer to the robot.
+    use_rgb_distance_triggers: true
+    bar_search_slow_top_y_ratio: 0.18
+    bar_trigger_top_y_ratio: 0.08
+    # Raw RGB/depth are not pixel-aligned. Split the bar sampling strip into
+    # foreground/background depth clusters and use the nearest supported one.
+    bar_depth_cluster_enabled: true
+    bar_depth_cluster_gap_m: 0.30
+    bar_depth_cluster_min_pixels: 6
+    bar_depth_cluster_min_ratio: 0.05
+    bar_clear_forward_speed: 0.25
+    obstacle_align_vy_k: 0.22
+    obstacle_align_vy_max: 0.18
+    obstacle_align_vy_min: 0.08
+    obstacle_center_px_deadband: 12
+    obstacle.use_depth_filter: false
+    obstacle.min_area: 7000
+    obstacle.max_area: 40000
+    obstacle.min_aspect_ratio: 0.7
+    obstacle.max_aspect_ratio: 1.3
+    obstacle.min_bottom_y_ratio_in_roi: 0.5
+    obstacle_approach_pitch_bottom_y_ratio: 0.75
+    obstacle_trigger_bottom_y_ratio: 0.90
+
+    dashed_align_vy_k: 0.22
+    dashed_align_vy_max: 0.18
+    dashed_align_vy_min: 0.08
+    dashed_center_px_deadband: 12
+
+    align_vy_k: 0.22
+    align_vy_max: 0.16
+    align_vy_min: 0.08
+    center_px_deadband: 12
+    align_forward_speed_far: 0.30
+    align_forward_speed_near: 0.15
+    cola_slow_cap_area_ratio: 0.0015
+    cola_hit_cap_area_ratio: 0.0040
+    blue_ball_slow_area_ratio: 0.015
+    blue_ball_hit_area_ratio: 0.040
+    blue_ball_slow_radius_px: 35.0
+    blue_ball_hit_radius_px: 60.0
+    basketball_ai_roi_x_min_ratio: 0.20
+    basketball_ai_roi_x_max_ratio: 0.80
+    basketball_ai_roi_y_min_ratio: 0.05
+    basketball_ai_roi_y_max_ratio: 0.90
+    basketball_ai_max_age_s: 0.50
+    basketball_top_slow_y_ratio: 0.35
+    basketball_top_trigger_y_ratio: 0.25
+    basketball_top_trigger_confirm_frames: 3
+    white_ball_slow_area_ratio: 0.015
+    white_ball_hit_area_ratio: 0.040
+    white_ball_slow_radius_px: 35.0
+    white_ball_hit_radius_px: 60.0
+    hit_blue_ball_duration_s: 2.0
+    hit_white_ball_duration_s: 2.0
+    hit_cola_duration_s: 2.0
+    bar_backoff_duration_s: 3.0
+    bar_backoff_speed: 0.40
+    after_hit_backoff_duration_s: 1.0
+    after_hit_backoff_speed: 0.40
+
+    post_hit_obstacle_align_vy_k: 0.22
+    post_hit_obstacle_align_vy_max: 0.16
+    post_hit_obstacle_align_vy_min: 0.08
+    post_hit_obstacle_center_px_deadband: 12
+    post_hit_obstacle_trigger_bottom_y_ratio: 0.95
+
+    # RGB and depth streams are not registered on the physical robot.  The
+    # previous left/right samples differed by 2.355 m on one bar, so using
+    # that value for yaw correction caused continuous turning during centering.
+    bar_depth_yaw_align_enabled: false
+    bar_depth_yaw_fixed_wz: 0.06
+
+    # Physical camera topics.  RGB/depth keep the same processing
+    # assumptions as simulation; no extra alignment/remapping is performed.
+    rgb_topic: /mi_desktop_48_b0_2d_7b_00_e2/image_rgb
+    depth_topic: /mi_desktop_48_b0_2d_7b_00_e2/camera/depth/image_rect_raw
+    ai_camera_topic: /mi_desktop_48_b0_2d_7b_00_e2/image
+
+    # Stage 2 already owns the fisheye subscriptions; only the topic names
+    # change on the physical robot.
+    fisheye_left_topic: /mi_desktop_48_b0_2d_7b_00_e2/image_left
+    fisheye_right_topic: /mi_desktop_48_b0_2d_7b_00_e2/image_right
+
+    # Verified command namespace from the user's MotionServoCmd test.
+    # Confirm response/service with `ros2 topic list` / `ros2 service list`.
+    real_motion_servo_cmd_topic: /mi_desktop_48_b0_2d_7b_00_e2/motion_servo_cmd
+    real_motion_servo_response_topic: /mi_desktop_48_b0_2d_7b_00_e2/motion_servo_response
+    real_motion_result_service: /mi_desktop_48_b0_2d_7b_00_e2/motion_result_cmd
+
+    # Keep the source that has already been tested on the robot.
+    real_cmd_source: 0
+
+    # Continuous locomotion defaults.
+    real_default_servo_motion_id: 303
+    real_servo_publish_hz: 20.0
+    real_servo_start_repeat: 5
+    real_servo_end_repeat: 5
+    # Keep neutral START x5 at 20 Hz, but minimize the extra delay before DATA.
+    # 5 START frames take about 0.20 s after the first immediate frame; then wait 0.15 s.
+    real_servo_start_settle_s: 0.0
+    real_servo_start_ack_timeout_s: 2.0
+
+    # Result actions.
+    real_recovery_motion_id: 111
+    real_emergency_stop_motion_id: 0
+    real_lie_down_motion_id: 101
+    real_left_jump_motion_id: 134
+    real_right_jump_motion_id: 135
+    real_forward_jump_motion_id: 132
+    real_action_wait_timeout_s: 45.0
+    real_motion_service_wait_timeout_s: 2.0
+
+    # Temporary legacy gait -> real servo mapping while Stage 6 and a few
+    # special Stage-4/5 paths still construct the old LCM-shaped message.
+    # Legacy gait labels are preserved only for compatibility; real locomotion uses slow servo motion 303 by default.
+    real_legacy_gait0_motion_id: 303
+    real_legacy_gait1_motion_id: 303
+    real_legacy_gait3_motion_id: 303
+    real_legacy_gait27_motion_id: 303

@@ -1,0 +1,72 @@
+# 第五赛段实体赛道参数档（stage5_profile:=physical）——占位，不可比赛使用。
+#
+# 每一个数值都必须按 STAGE5_PHYSICAL_REDESIGN_PLAN.md Phase E（实体样台
+# 数据采集与标定）重新整定后才有效。本档刻意保守：
+# - 视觉缺失/冻结默认停住（fail-safe），不盲走；
+# - 丢线补偿有硬时间上限；
+# - 速度显著低于仿真值。
+# 注意：仿真调出的时长参数（*_duration_s）与速度耦合（时长×速度=距离），
+# 本档降低速度后这些距离不再成立——这正是占位的含义：整段时序都要重标。
+/**:
+  ros__parameters:
+    # 实体机没有 Gazebo /clock；安全时限本身另由 monotonic 时钟保证。
+    use_sim_time: false
+
+    # fail-safe 层
+    p5_keep_moving_when_no_image: false
+    p5_sensor_watchdog_enabled: true
+    p5_sensor_max_frame_age_s: 1.0
+    p5_sensor_fault_grace_s: 1.5
+    p5_up_slope_timeout_s: 45.0
+    p5_right_slope_1_timeout_s: 40.0
+    p5_right_slope_2_timeout_s: 40.0
+    p5_action_require_progress: true
+    # 保守占位；Phase E 必须按足端接触与姿态稳定数据重新标定。
+    p5_action_post_complete_hold_s: 3.0
+
+    # 真实桥面尚未标定动作落点，Phase E 前不沿用仿真的跳转动作。
+    p5_after_up_slope_turn_method: velocity
+    p5_timed_motion_timeout_factor: 2.0
+    p5_timed_motion_timeout_margin_s: 1.0
+    # G0 前禁用：真实 depth/CameraInfo/IMU/外参与同步契约尚未确认。
+    p5_bridge_observer_enabled: false
+    p5_right_slope_3_timeout_s: 40.0
+    p5_right_slope_lost_extra_max_hold_s: 1.0
+
+    # 证据日志（Phase E 试验记录用；目录需在目标机存在可写）
+    p5_evidence_log_dir: ''
+
+    # ------------------------------------------------------------------
+    # 路线模型（计划 §4.1/§4.2）
+    # ------------------------------------------------------------------
+    # 里程窗口沿用代码默认值（图纸推导），不在这里覆盖：Phase E 必须用样台
+    # 实测长度替换，并记录参考基准（中心线 vs 内侧边缘）。
+    p5_route_model_enabled: true
+    # G1 之前不让未标定的窗口去改变状态转移：只观测记录，为标定提供数据。
+    p5_route_model_mode: monitor
+    p5_route_overrun_action: fault
+    p5_route_odometry_required: true
+    # 实体 state_estimator 的发布频率与漂移必须在 G0 实测后重标。
+    p5_route_odom_max_age_s: 0.50
+    p5_route_odom_max_step_m: 0.10
+    # 段限速在实体上生效：段表默认 0.20~0.25 m/s，比本档速度更保守时取小。
+    p5_route_speed_cap_enabled: true
+    # TODO(Phase E): 转角动作（速度转向 vs 定点跳转）在实体上的实际转角未标定，
+    # 用未标定的期望值做校核只会产生错误的再对齐；标定后再打开。
+    p5_route_turn_verify_enabled: false
+    p5_route_realign_max_attempts: 1
+    # TODO(Phase E): 路线航向栅格基准 p5_route_base_yaw_deg 这里刻意不声明，
+    # 走实测兜底。实体 state_estimator 的偏航零点在开机处，与场地方向没有
+    # 固定关系，所以声明值必须在 G0 用“机体对准赛道方向时读到的偏航”标定
+    # 出来，再填进来。仿真里不标定的代价已经量化：栅格锚在开局站姿上时，
+    # 20 跑中 9 跑丢在爬坡段（计划书第 29 条）。
+
+    # TODO(Phase E): 以下全部为保守占位速度，必须实测重标；
+    # 黄线视觉参数（HSV/ROI）同样需要按场地光照重标，这里不预填。
+    p5_step_up_vx: 0.20
+    p5_up_slope_vx: 0.20
+    p5_right_slope_1_vx: 0.15
+    p5_right_slope_2_vx: 0.15
+    p5_right_slope_3_vx: 0.15
+    p5_forward_after_reset_body_vx: 0.25
+    p5_forward_no_align_after_reset_body_vx: 0.25

@@ -1,0 +1,31 @@
+# 第五赛段仿真参数档（stage5_profile:=sim_odometry）——里程主导、不依赖黄线。
+#
+# 这是一个**增量档**：启动时先加载 config/stage5_sim.yaml，再用本文件覆盖，
+# 所以这里只写与黄线主导基线的差异，其余（速度、时长、体态、看门狗、
+# 里程窗口、转角期望航向）全部沿用 stage5_sim.yaml。
+#
+# 与 sim 档的本质区别：
+# - 四条直行段的段尾证据由“中间/右侧黄色消失”改为“里程走满声明长度”；
+# - 黄线横向/航向闭环修正全部关闭，只保留各段标定好的固定 vy/wz 基准值。
+#
+# 代价必须写清楚（STAGE5_PHYSICAL_REDESIGN_PLAN.md §1）：直行段因此是
+# **单证据推进**，即 fallback 第 3 档（有界航位推算）。它由三层封顶：
+# 段窗口 max_m、每状态超时、以及里程流本身的 watchdog（丢里程即停）。
+# 转角仍然有独立的第二证据——里程航向校核 + 有界再对齐。
+# 只有实体样台实测长度（Phase E）能让这些长度对真实赛道成立；
+# 下面的数值是 race.world 里 state_estimator 的实测值，不是赛道尺寸。
+/**:
+  ros__parameters:
+    p5_route_exit_source: odometry
+    p5_yellow_lateral_correction_enabled: false
+
+    # 段尾里程长度：取 2026-08-03 三次 race.world 实测的中位/均值。
+    # up_slope   3.774 / 3.781 / 3.823 -> 3.80
+    # straight_1 3.238 / 3.188 / 3.275 -> 3.23
+    # straight_2 2.759 / 2.659         -> 2.71   （1.918 是被否决的过早触发）
+    # straight_3 2.929 / 2.925         -> 2.93
+    # 每个值都必须落在 stage5_sim.yaml 的对应窗口内，否则段表校验会拒绝启动。
+    p5_route_up_slope_expected_m: 3.80
+    p5_route_straight_1_expected_m: 3.23
+    p5_route_straight_2_expected_m: 2.71
+    p5_route_straight_3_expected_m: 2.93

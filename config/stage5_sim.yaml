@@ -1,0 +1,209 @@
+# 第五赛段仿真参数档（stage5_profile:=sim，默认档）。
+#
+# 作用：在代码默认值转向 fail-safe（丢图即停、丢线补偿限时）之后，
+# 显式恢复拆分前已在仿真里验证过的行为，保证现有仿真回归不变。
+# 这份档只用于 Gazebo 仿真；真实机器人必须用 stage5_physical.yaml
+# 并按 STAGE5_PHYSICAL_REDESIGN_PLAN.md Phase E 重新标定。
+/**:
+  ros__parameters:
+    # 状态进入后暂时没有新帧时继续走（仿真帧流稳定，旧行为）。
+    p5_keep_moving_when_no_image: true
+
+    # 0 = 不限制丢线补偿持续时间（保持旧仿真语义：补偿到本段结束）。
+    p5_right_slope_lost_extra_max_hold_s: 0.0
+
+    # watchdog 在仿真也保持开启，验证故障路径本身；
+    # 阈值放宽，避免打断已调通的运行节奏。
+    p5_sensor_watchdog_enabled: true
+    p5_sensor_max_frame_age_s: 2.0
+    p5_sensor_fault_grace_s: 2.0
+
+    # 丢单重发（计划 19 条）：三批 30 跑里 5 次动作超时是控制器根本没接单
+    # （回显上一单 mode 7/9、order_process_bar=100 直到超时），其中两跑机体
+    # 已在转角上居中——路线全对，死在握手。响应流活跃但 3 s 内不回显目标
+    # mode 时重发一次；动作执行中（回显 mode 等于目标）绝不重发。
+    p5_action_resend_max: 1
+    p5_action_resend_after_s: 3.0
+
+    # 卡死解楔（计划 33 条）：与丢单重发互补的另一半。控制器回显的正是本
+    # 目标（mode=16、gait 对得上、incomplete 边沿见过），却把
+    # order_process_bar 永久钉在 0。
+    #
+    # 2026-08-05 corner1_bracketed 批 12 跑逐帧对真值：终点长跳（gait 1）
+    # 落地后估计器 z 完赛的 10 跑是 0.220~0.223，卡死的 2 跑是 0.164/0.165，
+    # 而 FsmStateJump3d 的 height_min_thresh 就是 0.20 —— 完赛的余量只有
+    # 2 cm。卡死两跑的落地俯仰是 +0.10 rad（完赛跑 -0.01~+0.02），机体停在
+    # 轨迹末姿势不再起身。前进量 0.650/0.648 m 对完赛跑的 0.649~0.670 m：
+    # 动作本身执行完了，只有握手没完成。
+    #
+    # 判定阈值 10 s 对最慢一次正常确认（终点长跳 4.26 s，78+37+44+46+62+59
+    # 次跳跃的全局最大值）留 2.3 倍余量；计时从"回显本目标且 bar<95"连续
+    # 成立起算，所以拒单救援的前置恢复站立期间不会误触。
+    p5_action_stall_unwedge_after_s: 10.0
+    p5_action_unwedge_release_timeout_s: 5.0
+
+    # 转角摔倒扶起（计划书第 37 条）。
+    #
+    # 2026-08-06 批次 36 跑里，四次 action_timeout 全部是预设转身跳
+    # （mode 16 / gait 3）把机体掀翻：136 次转身跳里 4 次翻车（约 3%），
+    # 而每跑要做 4 次。逐帧对真值检查过起跳前的位姿和速度，翻车跑与完赛跑
+    # 的分布完全重叠（进场速度 0.149~0.180 对 0.052~0.204），也就是说这是
+    # 动作本身的抽签，不是进场姿态没摆好。
+    #
+    # 摔倒后控制器闩在 kEdamp：control_fsm.cpp 把 current_state_ 强制换成
+    # kPureDamper，并且只有 edamp_iter > 1550 才重新读 CheckTransition()，
+    # 而恢复站立一旦触发 SafetyPostCheck 又立刻退回 kEdamp 并清零计数。
+    # 实测四跑都是回显 mode 7 / switch_status 3 / bar 100 直到 40 s 超时。
+    # 出口和卡死解楔一样只有 kOff。
+    #
+    # 扶起之后**不重试**，一律进故障保持：这条梯子买到的是"机体重新站着、
+    # 还能被指挥"，不是"这一跑还能救回来"。躺倒判据用姿态而不是位置，因为
+    # 里程计的姿态是准的（roll 1.948~1.994 对真值 1.948~1.994），位置在翻滚
+    # 之后则完全不可信（详见上面的说明与计划书第 37 条）。
+    p5_fall_recovery_enabled: true
+    p5_fall_recovery_max_attempts: 1
+    p5_fall_recovery_min_rp_rad: 1.20
+    # 起身超时 45 s（2026-08-07 第一批实测把它从 25 s 抬上来）：那一批里
+    # 两跑都正确识别了摔倒、kOff 也在 0.1 s 内解开了 kEdamp，但恢复站立先在
+    # bar=0 上停 10 s（由第 33 条的解楔梯子踢开），随后翻正要 22.6/24.9 s，
+    # 结果 25 s 的超时正好在机体刚翻正、还没撑起来的那一拍上收掉了两跑。
+    p5_fall_recovery_stand_timeout_s: 45.0
+    p5_fall_recovery_total_timeout_s: 90.0
+
+    # 上桥步态：代码默认值在 2026-08-16 并入真机整定后改成了 3.0 s / 0.30 m·s⁻¹
+    # （真机上桥更慢更稳）。仿真回归是在 2.0 s / 0.45 m·s⁻¹ 上跑通到 P5_DONE 的，
+    # 这两条只有 physical 档单独覆盖过 vx，所以在这里显式钉回旧值，
+    # 保证 Gazebo 行为不因真机整定而改变。
+    p5_step_up_duration_s: 2.0
+    p5_up_slope_vx: 0.45
+
+    # 视觉门控状态整体超时：远大于正常段耗时，只拦截真正的卡死。
+    p5_up_slope_timeout_s: 60.0
+    p5_right_slope_1_timeout_s: 45.0
+    p5_right_slope_2_timeout_s: 45.0
+    p5_right_slope_3_timeout_s: 45.0
+    p5_forward_after_reset_body_timeout_s: 20.0
+
+    # 非阻塞动作/STOP 握手；超时只进入故障保持，不自动推进。
+    # 拒单救援的完整预算（2026-08-04 实测）：3 s 判定 + 从 kLifted 恢复
+    # 站立完成实测 17.7 s + 跳跃执行 ~6 s + 确认余量。22 s 时救援在重发后
+    # 1.3 s 就被掐掉（resend_ladder 批 r01_starved_timeout_22s）。
+    # 动作状态没有独立的状态超时，这个值就是上限；真死链多等一会儿再
+    # 进故障保持，代价可接受。
+    p5_action_timeout_s: 40.0
+    p5_stop_timeout_s: 8.0
+    p5_action_min_ack_delay_s: 0.10
+    p5_action_require_progress: true
+    # 动作 ACK 后独立等待落地/稳定；不再借用 ACK 最小时延充当机械等待。
+    p5_action_post_complete_hold_s: 3.0
+    p5_timed_motion_timeout_factor: 5.0
+    p5_timed_motion_timeout_margin_s: 5.0
+
+    # 入口角点使用 +90° 定点动作；速度原地转向在 0.5 m 窄桥上会横漂离轨。
+    p5_after_up_slope_turn_method: right_jump
+
+    # D3：仿真 D435 只读观测，不接入现有控制状态机。
+    p5_bridge_observer_enabled: true
+    p5_bridge_observer_period_s: 0.20
+
+    # ------------------------------------------------------------------
+    # 路线模型（计划 §4.1/§4.2，仓库工作项 6）
+    # ------------------------------------------------------------------
+    # 里程来自 LCM state_estimator（robot_runner 50 Hz），仿真/实体同源。
+    # 注意：下面的窗口是 race.world 里 state_estimator 的实测路径长度，
+    # 不是图纸尺寸——代码默认值才是图纸推导值。实测见
+    # report_figures/stage5_2026-08-03_route_model_sim_regression_report.md。
+    p5_route_model_enabled: true
+    p5_route_model_mode: enforce
+    p5_route_overrun_action: fault
+    p5_route_odometry_required: true
+    p5_route_odom_max_age_s: 0.50
+    p5_route_odom_max_step_m: 0.20
+    # 仿真速度（0.30~0.45 m/s）是已标定的回归基线；段限速只针对实体档。
+    p5_route_speed_cap_enabled: false
+    p5_route_turn_verify_enabled: true
+
+    # 路线航向栅格基准：race.world 里起跑线在 (3.126, 7.3)，桥沿 +y 方向，
+    # 所以赛道方向就是 +90 度。仿真 LCM state_estimator 的偏航与世界系同向
+    # （位置有常量平移，偏航没有），20 跑实测 eyaw 与真值 tyaw 逐帧相等，
+    # 所以这里可以直接声明世界系角度。
+    #
+    # 不声明时栅格锚在开局实测偏航上，而那个值 20 跑里跨了 +1.11~+1.83 rad。
+    # 栅格误差会被里程兜底基准线原样放大成横向偏差，是爬坡段的主因：
+    # 误差 <= 0.03 rad 的 8 跑 0 失败，> 0.03 rad 的 12 跑 9 跑丢在爬坡。
+    p5_route_base_yaw_deg: 90.0
+
+    # 上桥前把机体转到声明航向上（计划书第 30 条）。
+    # 实测 P5_RECOVERY_STAND 会把机体转歪：2026-08-05 批里 r07 站起后 +31.3 度、
+    # r12 +25.0 度，而两跑站起前的起始位姿都是干净的（偏航在 0.10 rad 以内），
+    # 站起到上桥之间没有任何环节把它转回来。这两跑就是该批仅有的两次爬坡丢失。
+    # 容差 4 度：小于转角校核的 6 度容差，又大于站立姿态本身的抖动。
+    p5_start_align_enabled: true
+    p5_start_align_tol_deg: 4.0
+    p5_start_align_wz: 0.30
+    p5_start_align_timeout_s: 12.0
+    p5_route_realign_wz: 0.30
+    p5_route_realign_timeout_s: 6.0
+    p5_route_realign_max_attempts: 1
+
+    # 实测里程窗口（race.world）。窗口只用来拦截明显过早/过晚的视觉触发，
+    # 不用来给赛段计时。来源：run1（monitor 标定跑，state_estimator 实测）
+    # 与 run12 legacy 基线（Gazebo 位姿路径长度）两组样本。
+    p5_route_entry_step_up_min_m: 0.20
+    p5_route_entry_step_up_max_m: 1.20
+    p5_route_up_slope_min_m: 2.80
+    p5_route_up_slope_max_m: 4.60
+    p5_route_up_slope_exit_min_m: 0.10
+    p5_route_up_slope_exit_max_m: 1.10
+    p5_route_straight_1_min_m: 2.50
+    p5_route_straight_1_max_m: 4.20
+    p5_route_straight_1_exit_min_m: 0.10
+    p5_route_straight_1_exit_max_m: 0.90
+    p5_route_straight_2_min_m: 2.40
+    p5_route_straight_2_max_m: 3.60
+    p5_route_straight_2_exit_min_m: 0.10
+    p5_route_straight_2_exit_max_m: 0.90
+    p5_route_straight_3_min_m: 2.30
+    p5_route_straight_3_max_m: 4.00
+    p5_route_straight_3_exit_min_m: 0.10
+    p5_route_straight_3_exit_max_m: 0.90
+    p5_route_right_descent_align_min_m: 0.0
+    p5_route_right_descent_align_max_m: 0.80
+    p5_route_right_descent_min_m: 0.50
+    p5_route_right_descent_max_m: 2.20
+    p5_route_final_zone_min_m: 0.0
+    p5_route_final_zone_max_m: 2.00
+
+    # 转角期望航向：仿真 race.world 的桥形是折返而不是单向环，
+    # 第一个转角左转 +90（gait 0），其余三个右转 -90（gait 3）。
+    #
+    # 一号转角 90.0 -> 94.5（计划书第 38 条）。声明的是赛道要求的 90 度，
+    # 实测的是预设跳跃动作实际给出的角度，两者差 4.75 度而容差只有 6 度，
+    # 于是这个校核**在正常跑里触发**，而不是在转角真的失败时触发。
+    #
+    # 2026-08-06 批次 36 跑实测（odometry 量得的 corner_1 转角）：
+    #   中位 +94.75，范围 +93.20 ~ +97.20 —— 分布整体偏出 4.75 度，
+    #   离散只有 ±2 度。按 90±6 判定时 6/36 跑落在容差外并转入再对齐。
+    #
+    # 再对齐本身是有代价的：实测它每次把机体**朝赛道外侧推 +0.067 m**
+    # （6 次事件范围 +0.063 ~ +0.072，极其一致），而赛道半宽只有 0.245 m。
+    # 6 次再对齐里有 2 次（r11、r31）把已经偏外的机体推过边缘摔下赛道 ——
+    # 这就是该批次仅剩的两次 straight_1 失败。对照组很干净：没有再对齐的
+    # 30 跑里，0 跑在 straight_1 走出赛道。
+    #
+    # 而且再对齐几乎没修到东西：这两跑测得 +96.3 度，转了 0.5 s 之后是
+    # +95.3 度，改善 1 度就宣告成功（因为它只需要回到容差内）。也就是
+    # 说，付出 0.067 m 的横向代价，换来 1 度的航向。
+    #
+    # 按中位重新居中后，全批 36 跑的残差落在 -1.55 ~ +2.45 度，无一触发；
+    # 容差保持 6 度，仍然能抓住"转角完全没转"这类真实失败。
+    # 二、三号转角同样偏心（-95.7 / -97.8），但它们的再对齐没有牵涉任何
+    # 一次失败，且离散大得多（±9 度），所以本次不动，只记录。
+    p5_route_corner_1_expected_yaw_deg: 94.5
+    p5_route_corner_1_yaw_tol_deg: 6.0
+    p5_route_corner_2_expected_yaw_deg: -90.0
+    p5_route_corner_2_yaw_tol_deg: 6.0
+    p5_route_corner_3_expected_yaw_deg: -90.0
+    p5_route_corner_3_yaw_tol_deg: 6.0
+    p5_route_corner_4_expected_yaw_deg: -90.0
+    p5_route_corner_4_yaw_tol_deg: 6.0
