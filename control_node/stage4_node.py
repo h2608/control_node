@@ -1197,6 +1197,8 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
     OBSTACLE_ROUTE_PRE_TURN1_STEP = 'OBSTACLE_ROUTE_PRE_TURN1_STEP'
     OBSTACLE_ROUTE_TURN_1 = 'OBSTACLE_ROUTE_TURN_1'
     OBSTACLE_ROUTE_LATERAL_SCAN = 'OBSTACLE_ROUTE_LATERAL_SCAN'
+    # 单障碍物边缘达到视觉阈值后，不立刻前进；先继续同方向固定横移一小段。
+    OBSTACLE_ROUTE_AFTER_EDGE_LATERAL = 'OBSTACLE_ROUTE_AFTER_EDGE_LATERAL'
     OBSTACLE_ROUTE_FORWARD = 'OBSTACLE_ROUTE_FORWARD'
     # 固定前进完成后，在第二次90度转向前按 dashed_side 再横移一小段。
     OBSTACLE_ROUTE_PRE_TURN2_LATERAL = 'OBSTACLE_ROUTE_PRE_TURN2_LATERAL'
@@ -1228,10 +1230,13 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
     HIT_UPRIGHT_READY_STAND = 'HIT_UPRIGHT_READY_STAND'
     HIT_UPRIGHT_RECOVERY = 'HIT_UPRIGHT_RECOVERY'
 
-    # 撞击完成后的后续动作：后退 -> 两次左跳 -> 前进识别障碍物并按虚线侧选择单个障碍物对齐
+    # 撞击完成后的后续动作：后退 -> 水平低姿态原地踏步 -> 180度转向 -> 恢复前倾 -> 重新识别障碍物
     HIT_BACKOFF_AFTER_HIT = 'HIT_BACKOFF_AFTER_HIT'
+    HIT_BACKOFF_LEVEL_STEP = 'HIT_BACKOFF_LEVEL_STEP'
     POST_HIT_LEFT_JUMP = 'POST_HIT_LEFT_JUMP'
     APPROACH_SELECTED_OBSTACLE_AFTER_HIT = 'APPROACH_SELECTED_OBSTACLE_AFTER_HIT'
+    # 撞击回来靠近蓝色障碍物达到阈值后，先固定直行一小段，再停车播报并转向。
+    POST_HIT_OBSTACLE_AFTER_TRIGGER_FORWARD = 'POST_HIT_OBSTACLE_AFTER_TRIGGER_FORWARD'
     POST_HIT_OBSTACLE_VOICE_WAIT = 'POST_HIT_OBSTACLE_VOICE_WAIT'
 
     # 新增：撞击后对齐障碍物到达指定距离后的后续动作
@@ -1614,7 +1619,7 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
         #   DASH_PRE_SIDE_SHIFT
         #     -> OBSTACLE_ROUTE_PRE_TURN1_STEP（原地踏步停稳）
         #     -> OBSTACLE_ROUTE_TURN_1（按真机实测符号：left=-wz / right=+wz）
-        #     -> OBSTACLE_ROUTE_LATERAL_SCAN（按 dashed_side 横移，只检测单个蓝色障碍物边缘）
+        #     -> OBSTACLE_ROUTE_AFTER_EDGE_LATERAL（第一次转向后直接固定左移，不做障碍物视觉）
         #     -> OBSTACLE_ROUTE_FORWARD（固定时间前进）
         #     -> OBSTACLE_ROUTE_PRE_TURN2_LATERAL（按 dashed_side 再横移一段，不做视觉）
         #     -> OBSTACLE_ROUTE_PRE_TURN2_STEP（原地踏步停稳）
@@ -1696,12 +1701,17 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
         # HIT_BACKOFF_AFTER_HIT:
         #   撞击完成后，按 after_hit_backoff_speed 后退
         #   after_hit_backoff_duration_s 秒。
+        #   完成后进入 HIT_BACKOFF_LEVEL_STEP。
+        #
+        # HIT_BACKOFF_LEVEL_STEP:
+        #   回退结束后保持 obstacle_low_body_height，pitch=0，零速度原地踏步
+        #   after_hit_pre_turn_step_duration_s 秒，让机身先从前倾恢复到水平。
         #   完成后进入 POST_HIT_LEFT_JUMP。
         #
         # POST_HIT_LEFT_JUMP:
-        #   后退完成后执行 after_hit_left_jump_count 次原地左跳。
-        #   通常是两次左跳，用于调整朝向。
-        #   完成后进入 APPROACH_SELECTED_OBSTACLE_AFTER_HIT。
+        #   当前已不是实际 left_jump，而是按 after_hit_left_jump_count 映射为固定时间转向。
+        #   默认 count=2，因此执行 180 度左转；转向过程保持 pitch=0。
+        #   完成后进入 APPROACH_SELECTED_OBSTACLE_AFTER_HIT，并恢复 obstacle_target_forward_pitch。
         #
         # APPROACH_SELECTED_OBSTACLE_AFTER_HIT:
         #   左跳完成后继续向前走，并重新识别蓝色障碍物。
@@ -1958,25 +1968,26 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
         # 每次90度转向前先原地踏步/停稳一小段时间，避免横移或前进结束后立刻转向。
         self.declare_parameter('obstacle_route_pre_turn_step_duration_s', 0.5)
 
-        # 第一次90度转向后，按 dashed_side 对应方向横移，同时给一个小的后退速度，
-        # 避免横移时继续贴近前方障碍物；这一阶段只检测蓝色障碍物。
-        self.declare_parameter('obstacle_route_lateral_speed', 0.10)
+        # 第一次90度转向后不再识别蓝色障碍物，直接纯定时左移。
+        # obstacle_route_after_edge_lateral_duration_s 现在作为这次左移的总持续时间；
+        # 保留原参数名以兼容已有 launch/命令行配置。
+        self.declare_parameter('obstacle_route_lateral_speed', 0.20)
         self.declare_parameter('obstacle_route_lateral_backward_speed', 0)
-        # left 路线看障碍物 bbox 左边缘：x1/W >= 该阈值时停止横移。
-        # right 路线镜像看 bbox 右边缘：x2/W <= 该阈值时停止横移。
-        self.declare_parameter('obstacle_route_left_edge_trigger_ratio', 0.50)
-        self.declare_parameter('obstacle_route_right_edge_trigger_ratio', 0.50)
+        # 以下边缘阈值参数仅保留兼容旧调试状态，正常流程不再使用。
+        self.declare_parameter('obstacle_route_left_edge_trigger_ratio', 0.90)
+        self.declare_parameter('obstacle_route_right_edge_trigger_ratio', 0.10)
         self.declare_parameter('obstacle_route_edge_confirm_frames', 2)
+        self.declare_parameter('obstacle_route_after_edge_lateral_duration_s', 4.5)
 
-        # 单障碍物边缘到阈值后，先固定向前一段时间。
+        # 第一次转向后的固定左移完成后，再固定向前一段时间。
         self.declare_parameter('obstacle_route_forward_speed', 0.20)
-        self.declare_parameter('obstacle_route_forward_duration_s', 2.5)
+        self.declare_parameter('obstacle_route_forward_duration_s', 3.0)
 
         # 第二次90度转向之前再做一次纯定时横移：
         # dashed_side=left -> 左移；dashed_side=right -> 右移。
         # 这一段不运行视觉检测并保持前倾；横移结束后进入 PRE_TURN2_STEP，在原地踏步时恢复 pitch=0。
-        self.declare_parameter('obstacle_route_pre_turn2_lateral_speed', 0.10)
-        self.declare_parameter('obstacle_route_pre_turn2_lateral_duration_s', 1.0)
+        self.declare_parameter('obstacle_route_pre_turn2_lateral_speed', 0.15)
+        self.declare_parameter('obstacle_route_pre_turn2_lateral_duration_s', 1.5)
 
         # ALIGN_DASHED_LINE 中短暂丢失虚线时仍按已锁定方向继续横移，
         # 但不要再复用预偏移速度，避免漏检期间快速冲过目标位置。
@@ -2091,9 +2102,10 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
         self.declare_parameter('bar_backoff_duration_s', 1.0)
         self.declare_parameter('bar_backoff_speed', 0.40)
 
-        # 障碍物流程撞击完成后：先固定时间后退，再执行后续转向。
-        self.declare_parameter('after_hit_backoff_duration_s', 1.0)
-        self.declare_parameter('after_hit_backoff_speed', 0.40)
+        # 障碍物流程撞击完成后：后退 -> 水平低姿态原地踏步 -> 180度转向。
+        self.declare_parameter('after_hit_backoff_duration_s', 2.0)
+        self.declare_parameter('after_hit_backoff_speed', 0.20)
+        self.declare_parameter('after_hit_pre_turn_step_duration_s', 0.5)
         self.declare_parameter('after_hit_left_jump_count', 2)
 
         # 限高杆与障碍物转向统一使用固定机身姿态、角速度和时长。
@@ -2105,14 +2117,16 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
         self.declare_parameter('p4_timed_turn_wz_90', 0.60)
         self.declare_parameter('p4_timed_turn_duration_90_s', 3.85)
         self.declare_parameter('p4_timed_turn_wz_180', 0.60)
-        self.declare_parameter('p4_timed_turn_duration_180_s', 7.7)
+        self.declare_parameter('p4_timed_turn_duration_180_s', 7.6)
 
         # 左跳完成后：前进并识别两个蓝色障碍物，按虚线侧选择其中一个居中
         # 之前虚线在左边 -> 对齐右边障碍物；之前虚线在右边 -> 对齐左边障碍物
-        self.declare_parameter('post_hit_obstacle_forward_speed', 0.50)
-        self.declare_parameter('post_hit_obstacle_search_forward_speed', 0.50)
+        self.declare_parameter('post_hit_obstacle_forward_speed', 0.15)
+        self.declare_parameter('post_hit_obstacle_search_forward_speed', 0.15)
         self.declare_parameter('post_hit_obstacle_trigger_distance_m', 0.25)
-        self.declare_parameter('post_hit_obstacle_trigger_bottom_y_ratio', 0.95)
+        self.declare_parameter('post_hit_obstacle_trigger_bottom_y_ratio', 0.70)
+        # 撞击回来靠近障碍物达到距离/画面阈值后，不立刻转向；先按当前前进速度直行固定时间。
+        self.declare_parameter('post_hit_obstacle_after_trigger_forward_duration_s', 2.0)
         self.declare_parameter(
             'post_hit_obstacle_align_vy_k', 0.22 if real_platform else 0.35)
         self.declare_parameter(
@@ -2124,13 +2138,13 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
 
         # 对齐选中障碍物并到达距离后：转向 -> 前进 -> 反向转向 -> 最后前进
         # 如果对齐左边障碍物：第一次左转；如果对齐右边障碍物：第一次右转
-        self.declare_parameter('post_hit_obs_turn_duration_s', 3.85)
+        self.declare_parameter('post_hit_obs_turn_duration_s', 2.0)
         self.declare_parameter('post_hit_obs_turn_wz', 0.60)
         self.declare_parameter('post_hit_obs_turn_tolerance_deg', 1.5)
-        self.declare_parameter('post_hit_obs_forward_duration_s', 1.6)
-        self.declare_parameter('post_hit_obs_forward_speed', 0.40)
+        self.declare_parameter('post_hit_obs_forward_duration_s', 2.0)
+        self.declare_parameter('post_hit_obs_forward_speed', 0.30)
         # 第二次转回后，先按仿真时间向前走一段，再进入最终横向黄线识别对正
-        self.declare_parameter('post_hit_final_forward_duration_s',0.50)
+        self.declare_parameter('post_hit_final_forward_duration_s', 1.0)
         self.declare_parameter('post_hit_final_forward_speed', 0.20)
         # 绕过障碍物第二次转回后的预前进阶段：如果提前看到前方横向黄线，
         # 只用它的角度修正 wz，不用它提前结束该状态。
@@ -2393,6 +2407,8 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
             self.get_parameter('obstacle_route_right_edge_trigger_ratio').value)
         self.obstacle_route_edge_confirm_frames = max(1, int(
             self.get_parameter('obstacle_route_edge_confirm_frames').value))
+        self.obstacle_route_after_edge_lateral_duration_s = max(0.0, float(
+            self.get_parameter('obstacle_route_after_edge_lateral_duration_s').value))
         self.obstacle_route_forward_speed = float(
             self.get_parameter('obstacle_route_forward_speed').value)
         self.obstacle_route_forward_duration_s = max(0.0, float(
@@ -2515,6 +2531,8 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
             self.get_parameter('bar_backoff_speed').value))
         self.after_hit_backoff_duration_s = float(self.get_parameter('after_hit_backoff_duration_s').value)
         self.after_hit_backoff_speed = abs(float(self.get_parameter('after_hit_backoff_speed').value))
+        self.after_hit_pre_turn_step_duration_s = max(0.0, float(
+            self.get_parameter('after_hit_pre_turn_step_duration_s').value))
         self.after_hit_left_jump_count = int(self.get_parameter('after_hit_left_jump_count').value)
         self.p4_timed_turn_body_height = float(
             self.get_parameter('p4_timed_turn_body_height').value)
@@ -2538,6 +2556,8 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
             self.get_parameter('post_hit_obstacle_trigger_distance_m').value)
         self.post_hit_obstacle_trigger_bottom_y_ratio = float(
             self.get_parameter('post_hit_obstacle_trigger_bottom_y_ratio').value)
+        self.post_hit_obstacle_after_trigger_forward_duration_s = max(0.0, float(
+            self.get_parameter('post_hit_obstacle_after_trigger_forward_duration_s').value))
         self.post_hit_obstacle_align_vy_k = float(self.get_parameter('post_hit_obstacle_align_vy_k').value)
         self.post_hit_obstacle_align_vy_max = float(self.get_parameter('post_hit_obstacle_align_vy_max').value)
         self.post_hit_obstacle_align_vy_min = float(self.get_parameter('post_hit_obstacle_align_vy_min').value)
@@ -3079,6 +3099,7 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
             self.OBSTACLE_ROUTE_PRE_TURN1_STEP,
             self.OBSTACLE_ROUTE_TURN_1,
             self.OBSTACLE_ROUTE_LATERAL_SCAN,
+            self.OBSTACLE_ROUTE_AFTER_EDGE_LATERAL,
             self.OBSTACLE_ROUTE_FORWARD,
             self.OBSTACLE_ROUTE_PRE_TURN2_LATERAL,
             self.OBSTACLE_ROUTE_PRE_TURN2_STEP,
@@ -3099,8 +3120,10 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
             self.HIT_UPRIGHT_READY_STAND,
             self.HIT_UPRIGHT_RECOVERY,
             self.HIT_BACKOFF_AFTER_HIT,
+            self.HIT_BACKOFF_LEVEL_STEP,
             self.POST_HIT_LEFT_JUMP,
             self.APPROACH_SELECTED_OBSTACLE_AFTER_HIT,
+            self.POST_HIT_OBSTACLE_AFTER_TRIGGER_FORWARD,
             self.POST_HIT_OBSTACLE_VOICE_WAIT,
             self.POST_HIT_OBS_TURN_1,
             self.POST_HIT_OBS_FORWARD,
@@ -3527,14 +3550,14 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
         p('obstacle.open_kernel', 3)
         p('obstacle.close_kernel', 5)
 
-        p('obstacle.min_area', 7000 if self.platform == 'real' else 150)
-        p('obstacle.max_area', 40000 if self.platform == 'real' else 1000000)
+        p('obstacle.min_area', 1000 if self.platform == 'real' else 150)
+        p('obstacle.max_area', 70000 if self.platform == 'real' else 1000000)
         p('obstacle.min_width', 10)
         p('obstacle.min_height', 10)
         p('obstacle.min_aspect_ratio', 0.7 if self.platform == 'real' else 0.0)
         p('obstacle.max_aspect_ratio', 1.3 if self.platform == 'real' else 4.5)
         p('obstacle.min_bottom_y_ratio_in_roi',
-          0.5 if self.platform == 'real' else 0.2)
+          0.3 if self.platform == 'real' else 0.2)
 
         p('obstacle.min_valid_depth_ratio', 0.20)
         p('obstacle.min_near_depth_ratio', 0.35)
@@ -4648,6 +4671,7 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
             cls.OBSTACLE_ROUTE_PRE_TURN1_STEP,
             cls.OBSTACLE_ROUTE_TURN_1,
             cls.OBSTACLE_ROUTE_LATERAL_SCAN,
+            cls.OBSTACLE_ROUTE_AFTER_EDGE_LATERAL,
             cls.OBSTACLE_ROUTE_FORWARD,
             cls.OBSTACLE_ROUTE_PRE_TURN2_LATERAL,
             cls.OBSTACLE_ROUTE_PRE_TURN2_STEP,
@@ -4662,8 +4686,10 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
             cls.HIT_UPRIGHT_READY_STAND,
             cls.HIT_UPRIGHT_RECOVERY,
             cls.HIT_BACKOFF_AFTER_HIT,
+            cls.HIT_BACKOFF_LEVEL_STEP,
             cls.POST_HIT_LEFT_JUMP,
             cls.APPROACH_SELECTED_OBSTACLE_AFTER_HIT,
+            cls.POST_HIT_OBSTACLE_AFTER_TRIGGER_FORWARD,
             cls.POST_HIT_OBSTACLE_VOICE_WAIT,
             cls.POST_HIT_OBS_TURN_1,
             cls.POST_HIT_OBS_FORWARD,
@@ -4755,11 +4781,13 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
             self.OBSTACLE_ROUTE_PRE_TURN1_STEP,
             self.OBSTACLE_ROUTE_TURN_1,
             self.OBSTACLE_ROUTE_LATERAL_SCAN,
+            self.OBSTACLE_ROUTE_AFTER_EDGE_LATERAL,
             self.OBSTACLE_ROUTE_FORWARD,
             self.OBSTACLE_ROUTE_PRE_TURN2_LATERAL,
             self.OBSTACLE_ROUTE_PRE_TURN2_STEP,
             self.OBSTACLE_ROUTE_TURN_2,
             self.APPROACH_SELECTED_OBSTACLE_AFTER_HIT,
+            self.POST_HIT_OBSTACLE_AFTER_TRIGGER_FORWARD,
         ]
         if self.p4_initial_state in states_need_dashed_side and self.dashed_side not in ('left', 'right'):
             self.get_logger().warn(
@@ -4956,6 +4984,20 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
                 body_height=self.obstacle_low_body_height,
             )
 
+        if new_state == self.OBSTACLE_ROUTE_AFTER_EDGE_LATERAL:
+            # 第一次90度转向后固定左移，不再根据蓝色障碍物视觉结果决定结束位置。
+            vy = abs(self.obstacle_route_lateral_speed)
+            self.send_motion_cmd(
+                0.0, vy, 0.0,
+                pitch=self.dash_forward_pitch,
+                body_height=self.obstacle_low_body_height,
+            )
+            self.get_logger().info(
+                f'[OBS_ROUTE_FIXED_LEFT] enter: vy={vy:.3f}, '
+                f'duration={self.obstacle_route_after_edge_lateral_duration_s:.3f}s; '
+                f'vision OFF'
+            )
+
         if new_state == self.OBSTACLE_ROUTE_FORWARD:
             self.send_motion_cmd(
                 0.0, 0.0, 0.0,
@@ -5106,12 +5148,48 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
             self.after_hit_backoff_start_pose = None
             self.selected_obstacle_after_hit = None
 
+        if new_state == self.HIT_BACKOFF_LEVEL_STEP:
+            # 回退完成后先取消前倾，保持低机身，零速度原地踏步 0.5s（参数可调）。
+            self.send_motion_cmd(
+                0.0, 0.0, 0.0,
+                pitch=0.0,
+                body_height=self.obstacle_low_body_height,
+                step_height=self.p4_timed_turn_step_height,
+            )
+            self.get_logger().info(
+                f'[AFTER_HIT_LEVEL_STEP] enter: duration={self.after_hit_pre_turn_step_duration_s:.3f}s, '
+                f'pitch=0.000, height={self.obstacle_low_body_height:.3f}'
+            )
+
         if new_state == self.POST_HIT_LEFT_JUMP:
             self.selected_obstacle_after_hit = None
 
         if new_state == self.APPROACH_SELECTED_OBSTACLE_AFTER_HIT:
+            # 180度转向结束后恢复障碍物目标阶段的前倾姿态，再开始识别/靠近障碍物。
+            self.send_motion_cmd(
+                0.0, 0.0, 0.0,
+                pitch=self.obstacle_target_forward_pitch,
+                body_height=self.obstacle_low_body_height,
+            )
             self.selected_obstacle_after_hit = None
             self.selected_obstacle_after_hit_side = None
+            self.get_logger().info(
+                f'[POST_HIT_OBS] restore forward pitch after 180 turn: '
+                f'pitch={self.obstacle_target_forward_pitch:.3f}, '
+                f'height={self.obstacle_low_body_height:.3f}'
+            )
+
+        if new_state == self.POST_HIT_OBSTACLE_AFTER_TRIGGER_FORWARD:
+            self.send_motion_cmd(
+                self.post_hit_obstacle_forward_speed, 0.0, 0.0,
+                pitch=self.obstacle_target_forward_pitch,
+                body_height=self.obstacle_low_body_height,
+            )
+            self.get_logger().warn(
+                f'[POST_HIT_OBS_AFTER_TRIGGER_FORWARD] enter: '
+                f'vx={self.post_hit_obstacle_forward_speed:.3f}, '
+                f'duration={self.post_hit_obstacle_after_trigger_forward_duration_s:.3f}s'
+            )
 
         if new_state == self.POST_HIT_OBSTACLE_VOICE_WAIT:
             self.send_motion_cmd(0.0, 0.0, 0.0)
@@ -6806,9 +6884,10 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
                 self.get_logger().info(
                     f'[OBS_ROUTE_TURN1] finished: side={self.dashed_side}, '
                     f'elapsed={elapsed:.3f}/{self.obstacle_route_turn_duration_s:.3f}s; '
-                    f'go lateral single-obstacle scan'
+                    f'skip obstacle vision and start fixed left shift '
+                    f'{self.obstacle_route_after_edge_lateral_duration_s:.3f}s'
                 )
-                self.enter_state(self.OBSTACLE_ROUTE_LATERAL_SCAN)
+                self.enter_state(self.OBSTACLE_ROUTE_AFTER_EDGE_LATERAL)
                 return
 
             wz = self.get_obstacle_route_first_turn_dir() * abs(self.obstacle_route_turn_wz)
@@ -6851,9 +6930,10 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
                     f'[OBS_ROUTE_LATERAL] edge reached: side={self.dashed_side}, '
                     f'{edge_name}={edge_x:.1f}px threshold={threshold_x:.1f}px, '
                     f'confirm={self.obstacle_route_edge_confirm_count}/'
-                    f'{self.obstacle_route_edge_confirm_frames}; go fixed forward'
+                    f'{self.obstacle_route_edge_confirm_frames}; '
+                    f'continue fixed lateral for {self.obstacle_route_after_edge_lateral_duration_s:.3f}s'
                 )
-                self.enter_state(self.OBSTACLE_ROUTE_FORWARD)
+                self.enter_state(self.OBSTACLE_ROUTE_AFTER_EDGE_LATERAL)
                 return
 
             self.send_motion_cmd(
@@ -6868,6 +6948,31 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
                 f'{edge_name}={edge_x:.1f}px threshold={threshold_x:.1f}px, '
                 f'reached={reached}, confirm={self.obstacle_route_edge_confirm_count}/'
                 f'{self.obstacle_route_edge_confirm_frames}, vy={vy:.3f}; dashed detector OFF',
+                throttle_duration_sec=0.2
+            )
+            return
+
+        elif self.state == self.OBSTACLE_ROUTE_AFTER_EDGE_LATERAL:
+            elapsed = self.state_elapsed_s()
+            if elapsed >= self.obstacle_route_after_edge_lateral_duration_s:
+                self.get_logger().info(
+                    f'[OBS_ROUTE_FIXED_LEFT] finished: elapsed={elapsed:.3f}/'
+                    f'{self.obstacle_route_after_edge_lateral_duration_s:.3f}s; go fixed forward'
+                )
+                self.enter_state(self.OBSTACLE_ROUTE_FORWARD)
+                return
+
+            # 真机约定 +vy 为左移。此段完全不运行蓝色障碍物视觉判断。
+            vy = abs(self.obstacle_route_lateral_speed)
+            self.send_motion_cmd(
+                0.0, vy, 0.0,
+                pitch=self.dash_forward_pitch,
+                body_height=self.obstacle_low_body_height,
+            )
+            self.get_logger().info(
+                f'[OBS_ROUTE_FIXED_LEFT] vy={vy:.3f}, '
+                f'elapsed={elapsed:.3f}/{self.obstacle_route_after_edge_lateral_duration_s:.3f}s; '
+                f'vision OFF',
                 throttle_duration_sec=0.2
             )
             return
@@ -7430,17 +7535,42 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
         elif self.state == self.HIT_BACKOFF_AFTER_HIT:
             elapsed = self.state_elapsed_s()
             if elapsed >= self.after_hit_backoff_duration_s:
-                self.send_motion_cmd(0.0, 0.0, 0.0)
                 self.get_logger().info(
-                    f'[AFTER_HIT_BACKOFF] finished by sim time: elapsed={elapsed:.3f}/{self.after_hit_backoff_duration_s:.3f}s, go two left jumps'
+                    f'[AFTER_HIT_BACKOFF] finished by sim time: elapsed={elapsed:.3f}/{self.after_hit_backoff_duration_s:.3f}s, '
+                    f'go level stepping before 180 turn'
                 )
-                self.enter_state(self.POST_HIT_LEFT_JUMP)
+                self.enter_state(self.HIT_BACKOFF_LEVEL_STEP)
+                return
             else:
                 self.send_motion_cmd(-self.after_hit_backoff_speed, 0.0, 0.0)
                 self.get_logger().info(
                     f'[AFTER_HIT_BACKOFF] elapsed={elapsed:.3f}/{self.after_hit_backoff_duration_s:.3f}s',
                     throttle_duration_sec=0.2
                 )
+
+
+        elif self.state == self.HIT_BACKOFF_LEVEL_STEP:
+            elapsed = self.state_elapsed_s()
+            if elapsed >= self.after_hit_pre_turn_step_duration_s:
+                self.get_logger().info(
+                    f'[AFTER_HIT_LEVEL_STEP] finished: elapsed={elapsed:.3f}/'
+                    f'{self.after_hit_pre_turn_step_duration_s:.3f}s, start 180 turn'
+                )
+                self.enter_state(self.POST_HIT_LEFT_JUMP)
+                return
+
+            self.send_motion_cmd(
+                0.0, 0.0, 0.0,
+                pitch=0.0,
+                body_height=self.obstacle_low_body_height,
+                step_height=self.p4_timed_turn_step_height,
+            )
+            self.get_logger().info(
+                f'[AFTER_HIT_LEVEL_STEP] stepping in place: elapsed={elapsed:.3f}/'
+                f'{self.after_hit_pre_turn_step_duration_s:.3f}s, pitch=0.000',
+                throttle_duration_sec=0.2
+            )
+            return
 
 
         elif self.state == self.POST_HIT_LEFT_JUMP:
@@ -7499,12 +7629,7 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
                         f'depth={d}, bottom_y_ratio={bottom_y_ratio}, '
                         f'dashed_side={self.dashed_side}, go post-hit turn task'
                     )
-                    self.begin_voice_wait(
-                        wait_state=self.POST_HIT_OBSTACLE_VOICE_WAIT,
-                        event_id=f'post_hit_obstacle_before_turn_{self.completed_obstacle_count + 1}',
-                        voice_key='obstacle',
-                        resume_state=self.POST_HIT_OBS_TURN_1,
-                    )
+                    self.enter_state(self.POST_HIT_OBSTACLE_AFTER_TRIGGER_FORWARD)
                     return
 
                 # 只有一个障碍物但还没到距离：不居中，不给 vy，只继续直走。
@@ -7549,6 +7674,29 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
                     f'bottom_y_ratio={bottom_y_ratio}, '
                     f'dashed_side={self.dashed_side}, go post-hit turn task'
                 )
+                self.enter_state(self.POST_HIT_OBSTACLE_AFTER_TRIGGER_FORWARD)
+                return
+
+        elif self.state == self.BAR_BACKOFF_VOICE_WAIT:
+            self.handle_voice_wait(
+                pitch=self.bar_target_forward_pitch,
+                body_height=self.bar_low_body_height,
+            )
+            return
+
+        elif self.state == self.POST_HIT_OBSTACLE_AFTER_TRIGGER_FORWARD:
+            elapsed = self.state_elapsed_s()
+            if elapsed >= self.post_hit_obstacle_after_trigger_forward_duration_s:
+                self.send_motion_cmd(
+                    0.0, 0.0, 0.0,
+                    pitch=self.obstacle_target_forward_pitch,
+                    body_height=self.obstacle_low_body_height,
+                )
+                self.get_logger().info(
+                    f'[POST_HIT_OBS_AFTER_TRIGGER_FORWARD] finished: elapsed={elapsed:.3f}/'
+                    f'{self.post_hit_obstacle_after_trigger_forward_duration_s:.3f}s; '
+                    f'stop, announce, then turn'
+                )
                 self.begin_voice_wait(
                     wait_state=self.POST_HIT_OBSTACLE_VOICE_WAIT,
                     event_id=f'post_hit_obstacle_before_turn_{self.completed_obstacle_count + 1}',
@@ -7557,10 +7705,16 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
                 )
                 return
 
-        elif self.state == self.BAR_BACKOFF_VOICE_WAIT:
-            self.handle_voice_wait(
-                pitch=self.bar_target_forward_pitch,
-                body_height=self.bar_low_body_height,
+            self.send_motion_cmd(
+                self.post_hit_obstacle_forward_speed, 0.0, 0.0,
+                pitch=self.obstacle_target_forward_pitch,
+                body_height=self.obstacle_low_body_height,
+            )
+            self.get_logger().info(
+                f'[POST_HIT_OBS_AFTER_TRIGGER_FORWARD] vx={self.post_hit_obstacle_forward_speed:.3f}, '
+                f'elapsed={elapsed:.3f}/{self.post_hit_obstacle_after_trigger_forward_duration_s:.3f}s; '
+                f'vision OFF',
+                throttle_duration_sec=0.2
             )
             return
 
