@@ -19,6 +19,11 @@ Sign convention follows ``bridge_perception``: ``lateral_offset`` > 0 means the
 deck centreline lies to the body's left, so the correction is +vy (left).
 ``heading_error`` > 0 means the deck axis points front-left, so +wz (left).
 
+The loop is proportional by default and PI when ``k_i_vy`` is opted into.  The
+integral exists for one measured reason: on a banked surface the disturbance is
+a constant, and a P loop answers a constant disturbance with a constant error.
+See ``DeckLateralConfig.k_i_vy``.
+
 Engagement is deliberately conservative.  A single valid frame is never enough
 to steer on; the observer must agree with itself for ``min_consecutive_valid``
 frames.  When it goes blind the last correction is held only briefly, then
@@ -53,6 +58,7 @@ class DeckLateralConfig:
         'max_plausible_offset_m', 'blind_vx_scale',
         'centre_first_offset_m', 'centre_first_release_m',
         'centre_first_vx_scale', 'centre_first_max_s',
+        'k_i_vy', 'max_i_vy', 'max_integration_dt_s',
     )
 
     def __init__(self, **overrides):
@@ -91,6 +97,27 @@ class DeckLateralConfig:
         # deviation into a guaranteed stage failure.  Give up and walk (the
         # lateral term stays applied) rather than stand still.
         self.centre_first_max_s = 6.0
+        # Integral term on the lateral offset.  A proportional loop cannot
+        # cancel a *constant* lateral disturbance, and on a banked rail that is
+        # exactly what the loop faces: gravity pulls the body down the camber
+        # all segment long, and the segment's open-loop crab (``*_vy``) is a
+        # hand-calibrated guess at how much to lean against it.  Measured in
+        # ``race_physical.world`` 2026-08-16, straight_1: the crab overshoots by
+        # ~0.010 m/s, which the P term settles at rather than removes, so the
+        # body walks ~0.04 m per metre toward the rail's outer edge and topples
+        # around 0.11-0.12 m off centre — five of six runs, always that sign.
+        # The integrator makes the segment's crab self-calibrating: whatever
+        # constant lateral velocity error the profile's open-loop value leaves
+        # behind, it accumulates the offset until the correction cancels it.
+        # 0.0 disables it, which is the default — no existing profile changes
+        # behaviour unless it opts in.
+        self.k_i_vy = 0.0
+        # Authority bound.  The integral may never do more than the crab itself
+        # plausibly got wrong; past that the estimate is at fault, not the trim.
+        self.max_i_vy = 0.06
+        # Longest gap that still counts as continuous integration.  A dropout
+        # longer than this is a hole in the observation, not elapsed error.
+        self.max_integration_dt_s = 0.5
 
         for key, value in overrides.items():
             if key not in self.__slots__:
@@ -102,10 +129,11 @@ class DeckLateralCommand:
     """One loop output: the correction plus why it is what it is."""
 
     __slots__ = ('state', 'vy', 'wz', 'vx_scale', 'reason',
-                 'lateral_offset', 'heading_error', 'age_s')
+                 'lateral_offset', 'heading_error', 'age_s', 'vy_integral')
 
     def __init__(self, state, vy=0.0, wz=0.0, vx_scale=1.0, reason='',
-                 lateral_offset=None, heading_error=None, age_s=None):
+                 lateral_offset=None, heading_error=None, age_s=None,
+                 vy_integral=0.0):
         """Store the correction and its provenance."""
         self.state = state
         self.vy = float(vy)
@@ -115,6 +143,7 @@ class DeckLateralCommand:
         self.lateral_offset = lateral_offset
         self.heading_error = heading_error
         self.age_s = age_s
+        self.vy_integral = float(vy_integral)
 
     @property
     def engaged(self):
@@ -132,6 +161,7 @@ class DeckLateralCommand:
             'lateral_offset': self.lateral_offset,
             'heading_error': self.heading_error,
             'age_s': self.age_s,
+            'vy_integral': self.vy_integral,
         }
 
 
@@ -154,6 +184,8 @@ class DeckLateralController:
         self._centring = False
         self._centring_since_s = None
         self._centring_gave_up = False
+        self._vy_integral = 0.0
+        self._last_integration_s = None
 
     def _accept(self, observation):
         """Return (offset, heading) when the observation is usable, else None."""
@@ -195,10 +227,16 @@ class DeckLateralController:
                     vx_scale=cfg.centre_first_vx_scale if self._centring else 1.0,
                     reason='observation_stale', age_s=age,
                     lateral_offset=self._last_offset,
-                    heading_error=self._last_heading)
+                    heading_error=self._last_heading,
+                    vy_integral=self._vy_integral)
             self._last_vy = 0.0
             self._last_wz = 0.0
             self._centring = False
+            # Losing the observation for good means losing the reference the
+            # trim was accumulated against, so it goes with it.  Holding a
+            # blind integral is dead reckoning on a number nothing measured.
+            self._vy_integral = 0.0
+            self._last_integration_s = None
             return DeckLateralCommand(
                 CONTROL_BLIND, vx_scale=cfg.blind_vx_scale,
                 reason='observation_expired', age_s=age)
@@ -211,9 +249,11 @@ class DeckLateralController:
 
         if self._consecutive_valid < cfg.min_consecutive_valid:
             # Seen once is not seen: do not steer on an unconfirmed estimate.
+            self._last_integration_s = float(now_s)
             return DeckLateralCommand(
                 CONTROL_ENGAGING, reason='awaiting_confirmation',
-                lateral_offset=offset, heading_error=heading, age_s=0.0)
+                lateral_offset=offset, heading_error=heading, age_s=0.0,
+                vy_integral=self._vy_integral)
 
         lateral_term = 0.0
         if abs(offset) > cfg.deadband_m:
@@ -222,6 +262,7 @@ class DeckLateralController:
         if abs(heading) > cfg.heading_deadband_rad:
             heading_term = cfg.k_wz * heading
 
+        lateral_term += self._integrate(offset, lateral_term, float(now_s))
         self._last_vy = _clamp(lateral_term, cfg.max_vy)
         self._last_wz = _clamp(heading_term, cfg.max_wz)
         self._update_centring(abs(offset), float(now_s))
@@ -235,7 +276,38 @@ class DeckLateralController:
             CONTROL_ACTIVE, vy=self._last_vy, wz=self._last_wz,
             vx_scale=cfg.centre_first_vx_scale if self._centring else 1.0,
             reason=reason,
-            lateral_offset=offset, heading_error=heading, age_s=0.0)
+            lateral_offset=offset, heading_error=heading, age_s=0.0,
+            vy_integral=self._vy_integral)
+
+    def _integrate(self, offset, proportional_term, now_s):
+        """Accumulate the lateral trim and return its current contribution.
+
+        Unlike the proportional term this integrates *inside* the deadband too:
+        the deadband exists to stop the P term chattering around zero, whereas
+        the whole point of the trim is to grind out the residual the P term
+        settles at.  Anti-windup is a plain conditional — stop accumulating
+        once the summed correction is already pinned against ``max_vy`` and the
+        error would only push it further in — because a leaky or clamped-after
+        integrator both keep winding while the actuator cannot respond.
+        """
+        cfg = self.config
+        if cfg.k_i_vy <= 0.0 or cfg.max_i_vy <= 0.0:
+            self._vy_integral = 0.0
+            self._last_integration_s = now_s
+            return 0.0
+        previous = self._last_integration_s
+        self._last_integration_s = now_s
+        if previous is None:
+            return self._vy_integral
+        dt = now_s - previous
+        if dt <= 0.0 or dt > cfg.max_integration_dt_s:
+            return self._vy_integral
+        total = proportional_term + self._vy_integral
+        saturated = abs(total) >= cfg.max_vy and (total > 0.0) == (offset > 0.0)
+        if not saturated:
+            self._vy_integral = _clamp(
+                self._vy_integral + cfg.k_i_vy * offset * dt, cfg.max_i_vy)
+        return self._vy_integral
 
     def _update_centring(self, magnitude, now_s):
         """Latch/release the centre-first hold with hysteresis and a time bound.

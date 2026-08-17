@@ -29,6 +29,8 @@ from control_node.route_model import (
     RouteModel,
     RouteSegment,
     SegmentProgress,
+    StallGate,
+    ToppleGate,
     angle_delta_rad,
     clamp_speed,
     default_segments,
@@ -715,3 +717,113 @@ def test_sim_depth_declares_the_corner_1_approach_correction():
     """
     params = _load_profile(_PROFILE_CHAINS['sim_depth'])
     assert params['p5_route_up_slope_expected_m'] == pytest.approx(3.72)
+
+
+def test_topple_gate_is_off_by_default():
+    """A zero limit must leave every existing profile untouched."""
+    gate = ToppleGate()
+    assert not gate.enabled
+    for _ in range(100):
+        assert not gate.record(3.14, 0.0)
+
+
+def test_topple_gate_ignores_the_banked_riding_posture():
+    """The ring rails are ridden at ~0.48 rad of roll all segment long."""
+    gate = ToppleGate(limit_rad=1.0, consecutive_samples=25)
+    for _ in range(500):
+        assert not gate.record(-0.48, 0.05)
+    assert gate.snapshot()['worst_attitude_rad'] == pytest.approx(0.48)
+
+
+def test_topple_gate_needs_a_sustained_excursion():
+    """One bad attitude sample must not stop the stage."""
+    gate = ToppleGate(limit_rad=1.0, consecutive_samples=25)
+    for _ in range(24):
+        assert not gate.record(2.0, 0.0)
+    assert not gate.record(-0.48, 0.0)      # back upright: streak resets
+    for _ in range(24):
+        assert not gate.record(2.0, 0.0)
+    assert gate.record(2.0, 0.0)
+
+
+def test_topple_gate_trips_on_the_measured_false_completion():
+    """Replay of the 2026-08-16 run that walked the floor to P5_DONE.
+
+    The corner-3 jump threw the body off the rail; it rolled through 3.14 rad
+    for ~10 s, stood back up on the floor 1.16 m outside straight_3, and every
+    later distance window and corner check passed.
+    """
+    gate = ToppleGate(limit_rad=1.0, consecutive_samples=25)
+    tripped = False
+    for roll in [-0.48] * 100 + [-1.05, -1.15] + [3.14] * 500 + [-0.5] * 100:
+        tripped = gate.record(roll, 0.0) or tripped
+    assert tripped
+    # And it stays tripped after the robot stands up again, because standing up
+    # is not evidence of standing up *on the course*.
+    assert gate.snapshot()['tripped']
+    assert not gate.record(-0.48, 0.0)
+
+
+def test_topple_gate_treats_missing_attitude_as_no_evidence():
+    """NaN must not read as upright, and must not fault either."""
+    gate = ToppleGate(limit_rad=1.0, consecutive_samples=1)
+    assert not gate.record(float('nan'), float('nan'))
+    assert not gate.snapshot()['tripped']
+
+
+def test_topple_gate_pitch_counts_too():
+    """Nose-down over an edge is the same event as rolling off one."""
+    gate = ToppleGate(limit_rad=1.0, consecutive_samples=2)
+    assert not gate.record(0.0, 1.5)
+    assert gate.record(0.0, 1.5)
+
+
+def test_stall_gate_is_off_by_default():
+    """A zero budget must leave every existing profile untouched."""
+    gate = StallGate()
+    assert not gate.enabled
+    for i in range(100):
+        assert not gate.record(0.45, 0.20, i * 0.1)
+
+
+def test_stall_gate_ignores_a_robot_that_is_not_asked_to_move():
+    """A stopped robot making no progress is not stalled."""
+    gate = StallGate(min_speed=0.05, timeout_s=3.0)
+    for i in range(200):
+        assert not gate.record(0.0, 0.20, i * 0.1)
+
+
+def test_stall_gate_ignores_a_robot_that_is_moving():
+    """Progress resets the clock, so a walking robot never trips."""
+    gate = StallGate(min_speed=0.05, timeout_s=3.0, min_progress_m=0.05)
+    for i in range(200):
+        assert not gate.record(0.45, i * 0.02, i * 0.1)
+
+
+def test_stall_gate_trips_on_the_measured_ramp_stall():
+    """Replay: vx 0.45 commanded, odometry pinned at 0.20 m."""
+    gate = StallGate(min_speed=0.05, timeout_s=6.0, min_progress_m=0.05)
+    tripped = [i * 0.1 for i in range(200)
+               if gate.record(0.45, 0.20 + (i % 3) * 0.004, i * 0.1)]
+    assert len(tripped) == 1                       # latches, fires once
+    assert tripped[0] == pytest.approx(6.0, abs=0.15)
+
+
+def test_stall_gate_tolerates_estimator_jitter():
+    """A few mm of drift while standing must not read as progress."""
+    gate = StallGate(min_speed=0.05, timeout_s=3.0, min_progress_m=0.05)
+    fired = False
+    for i in range(100):
+        fired = gate.record(0.30, 1.50 + 0.004 * ((i % 5) - 2), i * 0.1) or fired
+    assert fired
+
+
+def test_stall_gate_reset_clears_the_latch_and_the_baseline():
+    """A new segment gets a new budget and a new progress reference."""
+    gate = StallGate(min_speed=0.05, timeout_s=1.0, min_progress_m=0.05)
+    for i in range(40):
+        gate.record(0.45, 0.20, i * 0.1)
+    assert gate.snapshot()['tripped']
+    gate.reset()
+    assert not gate.snapshot()['tripped']
+    assert not gate.record(0.45, 5.00, 10.0)

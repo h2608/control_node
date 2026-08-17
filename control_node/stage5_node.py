@@ -54,6 +54,8 @@ from control_node.route_model import (
     PROGRESS_YAW,
     TIER_DEAD_RECKONING,
     CrossTrackGate,
+    StallGate,
+    ToppleGate,
     EntryDepthGate,
     RouteModel,
     SegmentProgress,
@@ -151,6 +153,7 @@ class Stage5Node(StageNodeBase):
     # kEdamp，任何命令都被 kPureDamper 覆盖。梯子 kOff -> 恢复站立 -> 重试
     # 该转角一次；扶起后若机体已横向离开赛道则仍然进故障保持。
     P5_FALL_RECOVER = 'P5_FALL_RECOVER'
+    P5_STALL_RECOVER = 'P5_STALL_RECOVER'
 
     STAGE_ID = 5
 
@@ -227,6 +230,12 @@ class Stage5Node(StageNodeBase):
         self.action_sent = False
         self.p5_route_realign_attempts = 0
         self.p5_fall_recovery_attempts = 0
+        # Per run, not per segment: "the body went over at some point" is the
+        # fact the gate latches, and a new segment does not undo it.
+        self.p5_route_topple_gate.reset()
+        self.p5_route_stall_gate.reset()
+        self.p5_stall_recover_attempts = 0
+        self.p5_stall_recover_resume_state = ''
         self.p5_enter_state(self.p5_initial_state)
         # The first active control tick sends the intentional command for this
         # state. Robot_Ctrl does not heartbeat its zero-initialized message.
@@ -402,11 +411,16 @@ class Stage5Node(StageNodeBase):
         # 深度桥面居中闭环（默认关闭；仿真 profile 打开，实体需过 G0/G1）。
         self.p5_deck_lateral = DeckLateralController()
         self.p5_deck_lateral_last = None
+        self.p5_deck_lateral_debug_last = ''
+        self.p5_reset_body_roll_from = 0.0
         # 里程兜底：段入口基准线 + 路线航向栅格锚点。
         self.p5_route_base_yaw = None
         self.p5_route_base_yaw_declared = None
         self.p5_lateral_source_last = ''
         self.p5_route_lateral_anchor_m = 0.0
+        self.p5_route_lateral_anchor_suppressed_depth = False
+        self.p5_route_lateral_anchor_source = ''
+        self.p5_route_lateral_anchor_seq = None
         self.p5_imu_roll = 0.0
         self.p5_imu_pitch = 0.0
         self.p5_last_imu_monotonic_s = None
@@ -434,7 +448,10 @@ class Stage5Node(StageNodeBase):
         self.p5_route_entry_depth_faulted = False
         # 段内横向偏离门（同样保持关闭的安全默认值）。
         self.p5_route_cross_track_gate = CrossTrackGate()
+        # 翻倒闩锁（整跑一次，不随段重置）；同样保持关闭的安全默认值。
+        self.p5_route_topple_gate = ToppleGate()
         # 允许深度参与横向闭环的状态集合；空 = 不限制。
+        self.p5_deck_lateral_centre_first_states = frozenset()
         self.p5_deck_lateral_depth_states = frozenset()
         self.p5_lateral_depth_suppressed_state = ''
         self.p5_route_odom_valid = False
@@ -450,6 +467,9 @@ class Stage5Node(StageNodeBase):
         # 一次摔倒用掉预算后，下一次摔倒必须直接进故障保持，否则一条持续
         # 掀翻机体的动作会被无限次重试。
         self.p5_fall_recovery_attempts = 0
+        self.p5_stall_recover_resume_state = ''
+        self.p5_stall_recover_attempts = 0
+        self.p5_route_stall_gate = StallGate()
         self.p5_fall_recover_phase = ''
         self.p5_fall_recover_since_monotonic_s = None
         self.p5_fall_recover_retry_state = ''
@@ -874,6 +894,10 @@ class Stage5Node(StageNodeBase):
         self.declare_parameter('p5_reset_roll', 0.0)
         self.declare_parameter('p5_reset_height', 0.25)
         self.declare_parameter('p5_reset_body_wait_s', 0.3)
+        # 从赛道侧倾姿态恢复水平的斜坡时间（秒，0 = 一次到位，保持旧行为）。
+        # 一次到位等于把重心一步挪过整个横坡；race.world 有路缘接着，
+        # race_physical 没有，实测机体在三号边尾端 roll -0.47 -> +0.55 翻下去。
+        self.declare_parameter('p5_reset_body_ramp_s', 0.0)
 
         # =========================
         # 严格前方横向黄线检测参数
@@ -1070,6 +1094,28 @@ class Stage5Node(StageNodeBase):
         self.declare_parameter('p5_deck_lateral_centre_first_offset_m', 0.0)
         self.declare_parameter('p5_deck_lateral_centre_first_release_m', 0.03)
         self.declare_parameter('p5_deck_lateral_centre_first_vx_scale', 0.0)
+        # 允许“先归位再前进”降低 vx 的状态白名单（逗号分隔，空 = 不限制）。
+        # 归位保持是按环形边标定的：那里半宽 0.245 m 而实测 0.11 m 就掉下去。
+        # 爬坡段不是这样——桥面 0.504 m 宽、两侧各 0.252 m，0.08 m 的偏差
+        # 完全在横向回路自己能修的范围内，可是 vx 被压到 0.180 m·s⁻¹ 之后
+        # 机体上不了入口台阶：2026-08-16 十二跑里两跑就卡在坡底 y=8.05、
+        # z 掉到 0.13，然后 40 s 一动不动。爬坡要的是动量，不是站住横移。
+        self.declare_parameter('p5_deck_lateral_centre_first_states', '')
+        # 进入一段之后前多少米不参与横向/航向修正（0 = 关闭，行为不变）。
+        #
+        # **实测否决，默认必须保持 0。** 2026-08-16 十六跑：设成 0.5 之后
+        # 爬坡超时 2/11 -> 7/16、一号边通过 10/12 -> 6/16、完赛 2/11 -> 1/16。
+        # 这个门按里程算，于是和它要解决的问题构成死锁——机体走不动正是因为
+        # 没有修正，而门要等它走够 0.5 m 才放行：
+        #   odometry progress 0.06/3.72 m, cmd=(0.450,0.000,0.000), entry-hold 0.06/0.50 m
+        # 保留这个参数是为了让这条实测结论有地方写，不是为了给人打开。
+        self.declare_parameter('p5_deck_lateral_engage_after_m', 0.0)
+        # 横向积分项：把每段固定的 *_vy 开环横移量变成自校准量。
+        # 倾斜面上的扰动是常量，纯 P 回路对常量扰动只能收敛到一个常值误差，
+        # 这个误差在 race_physical 的环形边上实测约 0.04 m/m（见 deck_lateral.py）。
+        # 0 表示关闭（默认，任何已有档位行为不变）。
+        self.declare_parameter('p5_deck_lateral_k_i_vy', 0.0)
+        self.declare_parameter('p5_deck_lateral_max_i_vy', 0.06)
         # 深度观测不可用时，用里程相对段入口基准线兜底。
         self.declare_parameter('p5_route_lateral_fallback', False)
         self.declare_parameter('p5_route_lateral_heading_only', False)
@@ -1106,6 +1152,19 @@ class Stage5Node(StageNodeBase):
         # 但 2026-08-04 实测没有改善完成率（见计划书第 20 条），
         # 所以默认保持与实测最好的那一档一致，需要时再显式打开。
         self.declare_parameter('p5_route_lateral_anchor_enabled', False)
+        # 允许被 p5_deck_lateral_depth_states 压掉转向权的深度帧仍然参与锚定。
+        # 压制的理由是“这个面上的深度不能直接转向”，不是“这个面上的深度是假的”：
+        # race_physical 三跑实测，一号边入段那一帧深度报 -0.088/-0.069/-0.063，
+        # 真值 -0.088/-0.066/-0.060 —— 误差 5 mm 以内，却被整帧丢弃，
+        # 于是里程基准线锁在入口位姿上，把入段偏差当成零误差保持到走出赛道。
+        # 默认关闭：在 race.world 上同一帧带 +0.126 m 偏置（计划书第 34 条），
+        # 拿它锚定会把基准线拉歪，所以必须逐档显式打开。
+        self.declare_parameter('p5_route_lateral_anchor_suppressed_depth', False)
+        # 锚定量的合理上限（米）。默认沿用 route_lateral 的 0.60 m，即不额外收紧。
+        # 环形边半宽只有 0.245 m，而机体侧倾 0.48 rad 时实测约 0.11 m 就开始
+        # 掉下去，所以入段时报出 0.20 m 的深度定位一定是拟合坏了而不是姿态：
+        # 2026-08-16 实测 r02 在三号边入段被一帧 -0.206 m 锚死，整段照着它走。
+        self.declare_parameter('p5_route_lateral_anchor_max_m', 0.60)
         # 深度观测器单侧边缘兜底：环形赛道每条边外侧是抬起路缘而不是跌落，
         # 双边提取器在那里永远拿不到证据。宽度是已声明的赛道属性。
         self.declare_parameter('p5_bridge_single_sided_edges_enabled', False)
@@ -1127,6 +1186,20 @@ class Stage5Node(StageNodeBase):
         # 数是零。它拦的是**段内漂移**——三号边正是这一类。
         self.declare_parameter('p5_route_max_cross_track_m', 0.0)
         self.declare_parameter('p5_route_cross_track_samples', 25)
+        # 翻倒闩锁：机体侧倾/俯仰超过这个角度并持续若干采样就判定离开赛道。
+        # 0 = 关闭（默认，行为不变）。计划书第 37 条：翻滚会毁掉腿式里程计的
+        # 位置状态而不影响姿态，所以这里量的是“翻过去了”而不是“翻到哪儿”。
+        # 停滞检测（计划书第 11 条，长期未做）：命令在走、里程不动。
+        # 实测机体在桥面入口台阶前塌成劈叉（真值 z 从 0.30 掉到 0.13），
+        # 命令 vx=0.45 而里程钉在 0.20 m，一直耗到 45 s 状态超时，十一跑三跑。
+        # 判据必须是“命令速度 + 里程不动”这一对：原地转向时 vx 本来就是 0，
+        # 只看计时器会把正常的转向也判成停滞。0 = 关闭（默认，行为不变）。
+        self.declare_parameter('p5_route_stall_min_speed', 0.05)
+        self.declare_parameter('p5_route_stall_timeout_s', 0.0)
+        self.declare_parameter('p5_route_stall_min_progress_m', 0.05)
+        self.declare_parameter('p5_route_stall_max_attempts', 1)
+        self.declare_parameter('p5_route_topple_limit_rad', 0.0)
+        self.declare_parameter('p5_route_topple_samples', 25)
 
         # 可选角度修正
         self.declare_parameter('p5_yellow_angle_align_enabled', True)
@@ -1611,6 +1684,8 @@ class Stage5Node(StageNodeBase):
         self.p5_reset_roll = float(gp('p5_reset_roll').value)
         self.p5_reset_height = float(gp('p5_reset_height').value)
         self.p5_reset_body_wait_s = float(gp('p5_reset_body_wait_s').value)
+        self.p5_reset_body_ramp_s = max(
+            0.0, float(gp('p5_reset_body_ramp_s').value))
 
         self.p5_yellow_roi_top_ratio = float(gp('p5_yellow_roi_top_ratio').value)
         self.p5_yellow_roi_left_ratio = float(gp('p5_yellow_roi_left_ratio').value)
@@ -1753,6 +1828,8 @@ class Stage5Node(StageNodeBase):
                 0.0, float(gp('p5_deck_lateral_centre_first_release_m').value)),
             centre_first_vx_scale=min(1.0, max(0.0, float(
                 gp('p5_deck_lateral_centre_first_vx_scale').value))),
+            k_i_vy=max(0.0, float(gp('p5_deck_lateral_k_i_vy').value)),
+            max_i_vy=max(0.0, float(gp('p5_deck_lateral_max_i_vy').value)),
         ))
         self.p5_route_lateral_fallback = bool(
             gp('p5_route_lateral_fallback').value)
@@ -1774,6 +1851,10 @@ class Stage5Node(StageNodeBase):
             0.0, float(gp('p5_start_align_timeout_s').value))
         self.p5_route_lateral_anchor_enabled = bool(
             gp('p5_route_lateral_anchor_enabled').value)
+        self.p5_route_lateral_anchor_suppressed_depth = bool(
+            gp('p5_route_lateral_anchor_suppressed_depth').value)
+        self.p5_route_lateral_anchor_max_m = abs(
+            float(gp('p5_route_lateral_anchor_max_m').value))
         self.p5_bridge_config.single_sided_edges_enabled = bool(
             gp('p5_bridge_single_sided_edges_enabled').value)
         self.p5_bridge_config.declared_deck_width = max(
@@ -1801,6 +1882,27 @@ class Stage5Node(StageNodeBase):
             limit_m=max(0.0, float(gp('p5_route_max_cross_track_m').value)),
             consecutive_samples=max(
                 1, int(gp('p5_route_cross_track_samples').value)))
+        self.p5_route_topple_gate = ToppleGate(
+            limit_rad=abs(float(gp('p5_route_topple_limit_rad').value)),
+            consecutive_samples=max(
+                1, int(gp('p5_route_topple_samples').value)))
+        self.p5_route_stall_gate = StallGate(
+            min_speed=abs(float(gp('p5_route_stall_min_speed').value)),
+            timeout_s=max(0.0, float(gp('p5_route_stall_timeout_s').value)),
+            min_progress_m=abs(
+                float(gp('p5_route_stall_min_progress_m').value)))
+        self.p5_route_stall_max_attempts = max(
+            0, int(gp('p5_route_stall_max_attempts').value))
+        self.p5_deck_lateral_engage_after_m = max(
+            0.0, float(gp('p5_deck_lateral_engage_after_m').value))
+        self.p5_deck_lateral_centre_first_states = frozenset(
+            name.strip() for name
+            in str(gp('p5_deck_lateral_centre_first_states').value).split(',')
+            if name.strip())
+        if self.p5_deck_lateral_centre_first_states:
+            self.get_logger().info(
+                '[P5_PARAM] centre-first vx hold restricted to '
+                + ', '.join(sorted(self.p5_deck_lateral_centre_first_states)))
         self.p5_deck_lateral_depth_states = frozenset(
             name.strip() for name
             in str(gp('p5_deck_lateral_depth_states').value).split(',')
@@ -2234,6 +2336,14 @@ class Stage5Node(StageNodeBase):
         # 跳跃后对齐、下坡与终点区都是刻意的横向位移，在那里量横向偏离量的
         # 是动作本身。实测代价：不加这一条时连续三跑倒在 P5_FINAL_LONG_JUMP
         # ——P5_DONE 前的最后一个状态。
+        # 翻倒判定放在最前面，而且不看 lateral_profile：机体已经躺下这件事
+        # 与它在哪一段无关，而失败的转角跳跃恰恰把机体扔到段与段之间。
+        if self.p5_route_topple_gate.record(*self.p5_odom_attitude_rp()):
+            detail = {'segment': segment.name}
+            detail.update(self.p5_route_topple_gate.snapshot())
+            self.p5_route_fault('P5_ROUTE', 'route_topple_fault', detail)
+            return True
+
         if CrossTrackGate.applies_to(segment) and self.p5_route_cross_track_gate.record(
                 self.p5_route_progress.cross_track_m):
             detail = {'segment': segment.name}
@@ -2397,17 +2507,39 @@ class Stage5Node(StageNodeBase):
             line_offset_m=self.p5_route_lateral_anchor_m,
         )
 
-    def p5_route_lateral_reanchor(self, depth_observation, odometry_observation):
+    def p5_route_lateral_reanchor(self, depth_observation, odometry_observation,
+                                  once_per_segment=False):
         """Re-anchor the odometry line whenever depth can still see the deck.
 
         Without this the fallback holds the segment's entry pose, which reports
         zero error for a body that entered off centre — masking exactly the
         deviation the centre-first hold exists to catch.
+
+        Two guards, both learned the hard way (2026-08-16, ``race_physical``):
+
+        ``frame_seq`` de-duplication is not an optimisation.  The loop runs at
+        10 Hz and the observer at 5 Hz, so without it the anchor is recomputed
+        several times against the *same* depth fix while odometry keeps moving
+        underneath it — which solves ``anchor = depth - odometry(t)`` afresh
+        every tick and pins the reported offset to the held depth number.  The
+        odometry line then contributes nothing and the loop is steering on raw
+        depth, allow-list or no allow-list.
+
+        ``once_per_segment`` is what the allow-list means on a surface where
+        depth may not steer: one fix to place the line, then dead reckoning.
+        Measured on straight_3, where the observer is noisy: continuous
+        anchoring swung the line +0.009 -> -0.040 -> +0.093 m within two
+        seconds and the loop chased every swing.
         """
         if not self.p5_route_lateral_anchor_enabled:
             return
         if not (isinstance(depth_observation, dict)
                 and depth_observation.get('valid')):
+            return
+        seq = depth_observation.get('frame_seq')
+        if seq is not None and seq == self.p5_route_lateral_anchor_seq:
+            return
+        if once_per_segment and self.p5_route_lateral_anchor_source == str(self.state):
             return
         if not (isinstance(odometry_observation, dict)
                 and odometry_observation.get('valid')):
@@ -2419,11 +2551,38 @@ class Stage5Node(StageNodeBase):
         # back out so the new anchor is computed against the raw line.
         raw_unanchored = raw - float(odometry_observation.get('line_offset_m', 0.0))
         anchor = anchor_from_depth(
-            depth_observation.get('lateral_offset'), raw_unanchored)
+            depth_observation.get('lateral_offset'), raw_unanchored,
+            max_anchor_m=self.p5_route_lateral_anchor_max_m)
         if anchor is None:
+            # Not silent: a rejected fix means the segment dead-reckons from its
+            # entry pose, which is a materially weaker reference, and a failure
+            # trace has to show which of the two the run was steering on.
+            self.get_logger().warn(
+                f'[{self.state}] depth fix rejected for anchoring '
+                f'(offset={depth_observation.get("lateral_offset")}, '
+                f'limit={self.p5_route_lateral_anchor_max_m:.2f} m); '
+                f'odometry line stays on the segment entry pose',
+                throttle_duration_sec=5.0)
             return
-        if self.p5_route_lateral_anchor_m != anchor:
-            self.p5_route_lateral_anchor_m = anchor
+        self.p5_route_lateral_anchor_seq = seq
+        self.p5_route_lateral_anchor_m = anchor
+        if self.p5_route_lateral_anchor_source != str(self.state):
+            # Log once per state: the first anchor of a segment is the one that
+            # decides whether the fallback holds the course centreline or
+            # whatever pose the corner left the body in.
+            self.p5_route_lateral_anchor_source = str(self.state)
+            self.get_logger().info(
+                f'[{self.state}] odometry line anchored to depth: '
+                f'offset={depth_observation.get("lateral_offset")}, '
+                f'anchor={anchor:+.3f} m, once={once_per_segment}')
+            self.p5_evidence_log({
+                'event': 'route_lateral_anchor',
+                'state': str(self.state),
+                'anchor_m': anchor,
+                'once_per_segment': bool(once_per_segment),
+                'depth_lateral_offset':
+                    depth_observation.get('lateral_offset'),
+            })
 
     def p5_depth_observation_for_steering(self):
         """Return the depth observation only where it is allowed to steer.
@@ -2470,7 +2629,17 @@ class Stage5Node(StageNodeBase):
 
         depth_observation = self.p5_depth_observation_for_steering()
         odometry_observation = self.p5_route_lateral_observation()
-        self.p5_route_lateral_reanchor(depth_observation, odometry_observation)
+        # Anchoring and steering are separate privileges.  A surface where the
+        # observer may not hold the wheel can still be a surface where it fixes
+        # the line the dead-reckoned fallback holds — but only once, or the
+        # anchor becomes a back door through which the same suppressed frames
+        # steer anyway.
+        suppressed = (depth_observation is None
+                      and self.p5_route_lateral_anchor_suppressed_depth)
+        self.p5_route_lateral_reanchor(
+            self.latest_bridge_observation if suppressed else depth_observation,
+            odometry_observation,
+            once_per_segment=suppressed)
         observation, source = select_observation(
             depth_observation, odometry_observation)
         if source != self.p5_lateral_source_last:
@@ -2503,7 +2672,41 @@ class Stage5Node(StageNodeBase):
                 self.get_logger().warn(message)
             else:
                 self.get_logger().info(message)
+        # Segment-entry transient: the observation is real but the body is
+        # still landing, so steering on it means steering on the landing.
+        held_m = self.p5_deck_lateral_engage_after_m
+        if held_m > 0.0 and self.p5_route_active():
+            travelled = self.p5_route_distance_m()
+            if travelled is not None and travelled < held_m:
+                self.p5_deck_lateral_debug_last = (
+                    f'{source[:4]} entry-hold {travelled:.2f}/{held_m:.2f} m'
+                    f' anchor={self.p5_route_lateral_anchor_m:+.3f}')
+                return 0.0, 0.0, 1.0
+
+        allowed = self.p5_deck_lateral_centre_first_states
+        if allowed and str(self.state) not in allowed and command.vx_scale < 1.0:
+            # Only the forward hold is withdrawn; the lateral correction the
+            # loop computed is still applied, so this weakens the response to a
+            # big offset rather than removing it.
+            self.get_logger().info(
+                f'[{name}] centre-first vx hold not allowed here '
+                f'(offset={command.lateral_offset}); correcting while walking',
+                throttle_duration_sec=5.0)
+            command.vx_scale = 1.0
+
+        self.p5_deck_lateral_debug_last = (
+            f'{source[:4]} off='
+            f'{"n/a" if command.lateral_offset is None else f"{command.lateral_offset:+.3f}"}'
+            f' hdg='
+            f'{"n/a" if command.heading_error is None else f"{command.heading_error:+.3f}"}'
+            f' i={command.vy_integral:+.3f}'
+            f' anchor={self.p5_route_lateral_anchor_m:+.3f}'
+            f' {command.state}/{command.reason}')
         return command.vy, command.wz, command.vx_scale
+
+    def p5_deck_lateral_debug(self) -> str:
+        """Return the last lateral-loop inputs, for the segment progress line."""
+        return self.p5_deck_lateral_debug_last or 'off'
 
     def run_odometry_distance_velocity_state(
         self,
@@ -2574,13 +2777,26 @@ class Stage5Node(StageNodeBase):
         vy = vy + deck_vy
         wz = wz + deck_wz
 
+        if self.p5_route_stall_gate.record(
+                vx, decision.progress_m, time.monotonic()):
+            if not self.p5_stall_recovery_begin(name, decision.progress_m):
+                detail = {'segment': segment.name,
+                          'progress_m': float(decision.progress_m)}
+                detail.update(self.p5_route_stall_gate.snapshot())
+                self.p5_route_fault(name, 'route_stall_fault', detail)
+            return
+
         self.p5_send_velocity_command(
             vx=vx, vy=vy, wz=wz, step_height=step_height,
             roll=roll, pitch=pitch, body_height=body_height,
         )
+        # The lateral terms are printed alongside the command because a command
+        # on its own cannot be diagnosed: the same vy can be the loop holding a
+        # line or the loop chasing a bad estimate, and those need opposite fixes.
         self.get_logger().info(
             f'[{name}] odometry progress {decision.progress_m:.2f}/'
-            f'{segment.expected_m:.2f} m, cmd=({vx:.3f},{vy:.3f},{wz:.3f})',
+            f'{segment.expected_m:.2f} m, cmd=({vx:.3f},{vy:.3f},{wz:.3f}), '
+            f'lat={self.p5_deck_lateral_debug()}',
             throttle_duration_sec=1.0)
 
     def p5_route_check_turn(self, next_state: str) -> str:
@@ -2775,10 +2991,13 @@ class Stage5Node(StageNodeBase):
         # A new segment means a new deck: re-confirm before steering on it,
         # and drop the previous segment's line anchor with it.
         self.p5_route_lateral_anchor_m = 0.0
+        self.p5_route_lateral_anchor_source = ''
+        self.p5_route_lateral_anchor_seq = None
         self.p5_deck_lateral.reset()
         self.p5_deck_lateral_last = None
         # 新段 = 新入口基准线，横向偏离预算跟着重置。
         self.p5_route_cross_track_gate.reset()
+        self.p5_route_stall_gate.reset()
         # The re-alignment budget is per corner, not per stage run: one corner
         # spending it must not silently turn the next corner's first miss into
         # an immediate fault.
@@ -3138,6 +3357,38 @@ class Stage5Node(StageNodeBase):
             obs['forward_distance_reference'] = 'body_origin'
             self.latest_bridge_observation = obs
             self.get_logger().error(f'[P5_BRIDGE_OBSERVER] rejected frame: {e}')
+
+    def p5_reset_body_ramp_tick(self):
+        """Roll the body level in steps instead of in one command.
+
+        The straights hold ``p5_right_slope_roll`` (-0.6 rad) to lean into the
+        rail's camber; ``P5_RESET_BODY`` puts the body level again before the
+        corner-4 jump.  Doing that in one command moves the centre of mass
+        across the whole camber at once.  On ``race.world`` the border ledge at
+        the rail edge absorbs that; in ``race_physical`` there is no ledge, and
+        ground truth 2026-08-16 shows the body going roll -0.47 -> +0.19 ->
+        +0.55 over two seconds and sliding off the low side of straight_3
+        before the jump was ever commanded.
+
+        Zero-velocity commands are re-sent every tick so the interpolated
+        baseline is actually applied: ``set_body_roll_height`` only refreshes
+        while the controller is already in locomotion, and a standing robot
+        would otherwise sit at the old pose until the jump.
+        """
+        span = self.p5_reset_body_ramp_s
+        fraction = min(1.0, self.p5_state_elapsed_s() / span) if span > 0 else 1.0
+        roll = (self.p5_reset_body_roll_from
+                + (self.p5_reset_roll - self.p5_reset_body_roll_from) * fraction)
+        self.p5_send_velocity_command(
+            vx=0.0, vy=0.0, wz=0.0,
+            step_height=self.p5_right_slope_3_step_height,
+            roll=roll, pitch=0.0, body_height=self.p5_reset_height,
+        )
+        self.get_logger().info(
+            f'[P5_RESET_BODY] rolling level {self.p5_reset_body_roll_from:+.3f} '
+            f'-> {self.p5_reset_roll:+.3f}: now {roll:+.3f} '
+            f'({fraction * 100:.0f}%)',
+            throttle_duration_sec=0.5)
 
     def set_body_roll_height(self, roll: float, height: float):
         """设定身体 roll / 高度基线，随控制命令直接下发（不再改控制器 YAML）。
@@ -6279,6 +6530,23 @@ class Stage5Node(StageNodeBase):
             return None
         return roll, pitch
 
+    def p5_odom_attitude_rp(self):
+        """Return the latest odometry (roll, pitch), or (nan, nan) when stale.
+
+        NaN rather than zero: a missing attitude must not read as "upright" to
+        a gate whose whole job is to notice that the body is not.
+        """
+        nan = float('nan')
+        if self.Odom is None:
+            return nan, nan
+        snapshot = self.Odom.snapshot()
+        if snapshot['seq'] <= 0 or snapshot['rx_monotonic_s'] is None:
+            return nan, nan
+        age = max(0.0, time.monotonic() - float(snapshot['rx_monotonic_s']))
+        if age > self.p5_route_odom_max_age_s:
+            return nan, nan
+        return float(snapshot['rpy'][0]), float(snapshot['rpy'][1])
+
     def p5_fall_recovery_begin(self, log_name: str, snapshot: dict) -> bool:
         """Divert a fallen-robot timeout into the bounded pick-up ladder."""
         if not self.p5_fall_recovery_enabled:
@@ -6379,6 +6647,69 @@ class Stage5Node(StageNodeBase):
             if status != 'complete':
                 return
             self.p5_fall_recover_finish(stand_snapshot)
+
+    def p5_stall_recovery_begin(self, log_name: str, progress_m: float) -> bool:
+        """Divert a stalled segment into a bounded stand-up-and-resume.
+
+        This is deliberately *not* ``P5_FALL_RECOVER``.  That path holds rather
+        than resuming because a tumble destroys the leg odometry's position
+        state (plan item 37), so nothing on board can answer "am I still on the
+        course".  A stall is the opposite case: the robot never went over, its
+        attitude is level and its position estimate is exactly as good as it
+        was a moment ago — it is simply splayed and pushing against a step.
+        Resuming is sound *because* of that, so the check is enforced here
+        rather than assumed: a body that is actually down is refused, and falls
+        through to the caller's fault.
+        """
+        if self.p5_stall_recover_attempts >= self.p5_route_stall_max_attempts:
+            return False
+        roll, pitch = self.p5_odom_attitude_rp()
+        if roll != roll or pitch != pitch:
+            return False                       # no attitude: do not guess
+        if max(abs(roll), abs(pitch)) >= self.p5_fall_recovery_min_rp_rad:
+            return False                       # actually down: not this ladder
+        self.p5_stall_recover_attempts += 1
+        self.p5_stall_recover_resume_state = str(self.state)
+        self.get_logger().warn(
+            f'[{log_name}] stalled at {progress_m:.2f} m with vx commanded '
+            f'(roll={roll:+.2f} pitch={pitch:+.2f} rad, body is level); '
+            f'attempt {self.p5_stall_recover_attempts}/'
+            f'{self.p5_route_stall_max_attempts} to stand and resume')
+        self.p5_evidence_log({
+            'event': 'stall_recovery_begin',
+            'state': str(self.state),
+            'progress_m': float(progress_m),
+            'roll_rad': roll,
+            'pitch_rad': pitch,
+        })
+        self.p5_enter_state(self.P5_STALL_RECOVER)
+        return True
+
+    def p5_run_stall_recover(self):
+        """Recovery stand, then re-enter the stalled state, or fail closed."""
+        if not self.action_sent:
+            self.p5_begin_action_poll(12, 0, 'action')
+            self.action_sent = True
+            return
+        status, _, snapshot = self.p5_poll_action(
+            self.p5_fall_recovery_stand_timeout_s)
+        if status == 'timeout':
+            self.p5_route_fault('P5_STALL_RECOVER', 'route_stall_fault', {
+                'reason': 'recovery stand timed out',
+                'resume_state': self.p5_stall_recover_resume_state,
+            })
+            return
+        if status != 'complete':
+            return
+        resume = self.p5_stall_recover_resume_state or self.P5_SENSOR_FAULT_HOLD
+        self.get_logger().warn(
+            f'[P5_STALL_RECOVER] stood up, resuming {resume}')
+        self.p5_evidence_log({
+            'event': 'stall_recovery_resumed',
+            'state': resume,
+            'response': snapshot,
+        })
+        self.p5_enter_state(resume)
 
     def p5_fall_recover_finish(self, snapshot: dict):
         """Report the outcome of the pick-up and hold; never resume the route.
@@ -6826,13 +7157,20 @@ class Stage5Node(StageNodeBase):
 
             elif self.state == self.P5_RESET_BODY:
                 if not self.action_sent:
+                    self.p5_reset_body_roll_from = float(self.p5_last_cmd_roll)
                     self.set_body_roll_height(
-                        roll=self.p5_reset_roll,
+                        roll=(self.p5_reset_body_roll_from
+                              if self.p5_reset_body_ramp_s > 0.0
+                              else self.p5_reset_roll),
                         height=self.p5_reset_height
                     )
                     self.action_sent = True
 
-                if self.p5_state_elapsed_s() >= self.p5_reset_body_wait_s:
+                if self.p5_reset_body_ramp_s > 0.0:
+                    self.p5_reset_body_ramp_tick()
+
+                if self.p5_state_elapsed_s() >= max(
+                        self.p5_reset_body_wait_s, self.p5_reset_body_ramp_s):
                     self.get_logger().info(
                         '[P5_RESET_BODY] reset body done, go P5_RIGHT_JUMP_AFTER_RESET_BODY'
                     )
@@ -6975,6 +7313,9 @@ class Stage5Node(StageNodeBase):
 
             elif self.state == self.P5_FALL_RECOVER:
                 self.p5_run_fall_recover()
+
+            elif self.state == self.P5_STALL_RECOVER:
+                self.p5_run_stall_recover()
 
             elif self.state == self.P5_SENSOR_FAULT_HOLD:
                 # 传感器故障 / 状态超时：站定保持，等待人工恢复。

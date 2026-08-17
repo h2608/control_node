@@ -272,3 +272,134 @@ def test_centre_first_budget_is_restored_once_back_on_the_line():
     again = controller.update(obs(0.13), now_s=3.4)
     assert again.vx_scale == 0.0
     assert again.reason == 'centring'
+
+
+def integral_controller(**cfg):
+    """Return a PI controller already past its confirmation count."""
+    defaults = {'k_i_vy': 0.20, 'max_i_vy': 0.08, 'deadband_m': 0.02,
+                'k_vy': 0.70, 'max_vy': 0.18}
+    defaults.update(cfg)
+    return engaged_controller(**defaults)
+
+
+def test_integral_is_off_by_default():
+    """No existing profile may change behaviour by loading the new code."""
+    controller = engaged_controller()
+    cmd = controller.update(obs(0.10), now_s=0.1)
+    assert cmd.vy == pytest.approx(0.40 * 0.10)
+    assert cmd.vy_integral == 0.0
+
+
+def test_integral_accumulates_toward_the_offset():
+    """The trim grows in the direction of the standing error."""
+    controller = integral_controller()
+    first = controller.update(obs(0.05), now_s=0.1)
+    later = controller.update(obs(0.05), now_s=0.2)
+    assert later.vy_integral > first.vy_integral > 0.0
+    assert later.vy_integral == pytest.approx(0.20 * 0.05 * 0.2, abs=1e-9)
+    assert later.vy == pytest.approx(0.70 * 0.05 + later.vy_integral)
+
+
+def test_integral_works_inside_the_deadband():
+    """The residual a P loop settles at is exactly what the trim must remove.
+
+    The deadband silences the proportional term near zero; if it silenced the
+    integral too, the standing error the integral exists for would be the one
+    error it could never see.
+    """
+    controller = integral_controller()
+    cmd = controller.update(obs(0.01), now_s=0.1)
+    assert cmd.vy_integral > 0.0
+    assert cmd.vy == pytest.approx(cmd.vy_integral)
+
+
+def test_integral_is_bounded_by_max_i_vy():
+    """The trim may correct a mis-calibrated crab, not replace the controller."""
+    controller = integral_controller(max_i_vy=0.03)
+    now = 0.0
+    for _ in range(40):
+        now += 0.1
+        cmd = controller.update(obs(0.10), now_s=now)
+    assert cmd.vy_integral == pytest.approx(0.03)
+
+
+def test_integral_stops_winding_while_the_output_is_saturated():
+    """Classic anti-windup: no accumulation the actuator cannot act on."""
+    controller = integral_controller(max_vy=0.05)
+    now = 0.0
+    for _ in range(5):
+        now += 0.1
+        controller.update(obs(0.30), now_s=now)
+    pinned = controller.update(obs(0.30), now_s=now + 0.1)
+    assert pinned.vy == pytest.approx(0.05)
+    # 0.70 * 0.30 already exceeds max_vy on its own, so the trim never grew.
+    assert pinned.vy_integral == pytest.approx(0.0)
+
+
+def test_integral_still_unwinds_when_the_error_reverses():
+    """Anti-windup must not also freeze the way out of saturation."""
+    controller = integral_controller()
+    now = 0.0
+    for _ in range(20):
+        now += 0.1
+        controller.update(obs(0.05), now_s=now)
+    wound = controller.update(obs(0.05), now_s=now + 0.1).vy_integral
+    assert wound > 0.0
+    for _ in range(20):
+        now += 0.1
+        controller.update(obs(-0.05), now_s=now)
+    assert controller.update(obs(-0.05), now_s=now + 0.1).vy_integral < wound
+
+
+def test_integral_ignores_a_gap_longer_than_the_integration_window():
+    """A dropout is a hole in the observation, not elapsed error."""
+    controller = integral_controller(max_integration_dt_s=0.5)
+    controller.update(obs(0.05), now_s=0.1)
+    held = controller.update(obs(0.05), now_s=10.0)
+    assert held.vy_integral == pytest.approx(0.20 * 0.05 * 0.1, abs=1e-9)
+
+
+def test_integral_is_dropped_when_the_observation_expires():
+    """Losing the reference loses the trim accumulated against it."""
+    controller = integral_controller(max_age_s=1.0)
+    controller.update(obs(0.05), now_s=0.1)
+    assert controller.update(obs(0.05), now_s=0.2).vy_integral > 0.0
+    assert controller.update(None, now_s=0.7).state == CONTROL_HOLDING
+    expired = controller.update(None, now_s=3.0)
+    assert expired.state == CONTROL_BLIND
+    assert controller.update(obs(0.05), now_s=3.1).vy_integral == 0.0
+
+
+def test_reset_drops_the_trim():
+    """A new segment is a new deck and a new disturbance."""
+    controller = integral_controller()
+    controller.update(obs(0.05), now_s=0.1)
+    assert controller.update(obs(0.05), now_s=0.2).vy_integral > 0.0
+    controller.reset()
+    controller.update(obs(0.05), now_s=1.1)
+    assert controller.update(obs(0.05), now_s=1.2).vy_integral == pytest.approx(
+        0.20 * 0.05 * 0.1, abs=1e-9)
+
+
+def test_integral_cancels_a_constant_disturbance_a_p_loop_cannot():
+    """The measured race_physical failure, closed-loop, in one simulation.
+
+    Plant: commanded vy is realised at ~0.36 of its value (measured 2026-08-16
+    from the one run that crossed straight_1), against a constant 0.010 m/s
+    outward pull the segment's open-loop crab over-corrects into.  The P loop
+    settles at a standing error; the PI loop drives it to zero.
+    """
+    def walk(controller, seconds=20.0, dt=0.1):
+        offset = -0.088                       # measured entry offset
+        now = 0.0
+        for _ in range(int(seconds / dt)):
+            now += dt
+            cmd = controller.update(obs(offset), now_s=now)
+            offset += (-0.36 * cmd.vy - 0.010) * dt
+        return offset
+
+    proportional = walk(engaged_controller(k_vy=0.70, max_vy=0.18,
+                                           deadband_m=0.02))
+    integral = walk(integral_controller())
+    assert proportional < -0.03                 # standing error remains
+    assert abs(integral) < 0.01                 # trim removed it

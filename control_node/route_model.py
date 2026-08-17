@@ -778,6 +778,160 @@ class CrossTrackGate(object):
         }
 
 
+class ToppleGate(object):
+    """Run-time check: has the body been on its side since the stage started.
+
+    ``CrossTrackGate`` measures drift *within* a segment from the segment's own
+    entry line, so it is blind to a body that arrives already off the course —
+    which is exactly what a failed corner jump produces.  Measured 2026-08-16
+    (``race_physical``, 12 runs): one run was thrown off the rail by the
+    corner-3 jump, rolled through 3.14 rad, stood itself back up on the floor
+    1.16 m outside straight_3, and then satisfied every remaining distance
+    window and corner check to reach ``P5_DONE``.  Nothing in the stage noticed;
+    only the offline ground-truth audit did.  A false completion publishes
+    ``stage_complete`` and is strictly worse than a fault.
+
+    Attitude is the right measure for this and position is not.  Plan item 37
+    established that a tumble destroys the leg odometry's position state while
+    leaving attitude intact — two measured pick-ups stood the robot up 0.29 m
+    off the rail while odometry reported 0.024 m of displacement.  So the fact
+    worth latching is not *where* the body is but *that it went over*, which
+    attitude reports honestly and position does not.
+
+    The latch is deliberately permanent for the run.  A body that has been on
+    its side no longer has a trustworthy idea of where it is, so "it stood back
+    up" is not evidence that it stood back up *on the course*.
+    """
+
+    def __init__(self, limit_rad=0.0, consecutive_samples=25):
+        self.limit_rad = float(limit_rad)
+        self.consecutive_samples = int(consecutive_samples)
+        self.reset()
+
+    def reset(self):
+        """Clear the latch.  Call on stage entry, never on segment entry."""
+        self.streak = 0
+        self.tripped = False
+        self.worst_rad = 0.0
+
+    @property
+    def enabled(self):
+        return self.limit_rad > 0.0
+
+    def record(self, roll_rad, pitch_rad):
+        """Fold in one attitude sample; True the tick the gate trips."""
+        if not self.enabled or self.tripped:
+            return False
+        try:
+            roll = abs(float(roll_rad))
+            pitch = abs(float(pitch_rad))
+        except (TypeError, ValueError):
+            return False
+        if roll != roll or pitch != pitch:                      # NaN
+            return False
+        worst = max(roll, pitch)
+        if worst > self.worst_rad:
+            self.worst_rad = worst
+        if worst <= self.limit_rad:
+            self.streak = 0
+            return False
+        self.streak += 1
+        if self.streak < max(1, self.consecutive_samples):
+            return False
+        self.tripped = True
+        return True
+
+    def snapshot(self):
+        return {
+            'limit_rad': float(self.limit_rad),
+            'consecutive_samples': int(self.consecutive_samples),
+            'streak': int(self.streak),
+            'worst_attitude_rad': float(self.worst_rad),
+            'tripped': bool(self.tripped),
+        }
+
+
+class StallGate(object):
+    """Run-time check: is the robot being commanded to walk and not walking.
+
+    Plan item 11 has been open since the route model was written, and it costs
+    whole runs.  Measured 2026-08-16 (``race_physical``): the robot reaches the
+    bridge ramp, fails to mount the entrance step, settles into a splayed
+    stance (ground-truth body z drops from 0.30 to 0.13, below standing height
+    on flat floor), and then sits there with ``vx`` commanded at 0.45 m/s and
+    odometry frozen at 0.20 m until the 45 s state timeout ends the run.  Three
+    such runs in eleven.  The body rotates while it is stuck, so the lateral
+    loop then commands its full yaw authority against a robot that cannot move
+    — which reads in the log exactly like a steering fault and is not one.
+
+    What makes this detectable without a second sensor is the *pair*: a
+    commanded speed well above zero together with progress that does not
+    advance.  Either alone is normal — a stopped robot is commanded zero, and a
+    turning-in-place robot legitimately makes no forward progress with vx at
+    zero, which is why the speed term is required rather than a bare timer.
+
+    ``min_progress_m`` must exceed the estimator's own jitter; odometry drifts
+    by a few millimetres while standing, so a strict "no change at all" test
+    never fires.
+    """
+
+    def __init__(self, min_speed=0.0, timeout_s=0.0, min_progress_m=0.05):
+        self.min_speed = float(min_speed)
+        self.timeout_s = float(timeout_s)
+        self.min_progress_m = float(min_progress_m)
+        self.reset()
+
+    def reset(self):
+        """Start a fresh segment: a new segment is a new progress baseline."""
+        self.since_s = None
+        self.reference_m = None
+        self.tripped = False
+        self.worst_stall_s = 0.0
+
+    @property
+    def enabled(self):
+        return self.min_speed > 0.0 and self.timeout_s > 0.0
+
+    def record(self, commanded_speed, progress_m, now_s):
+        """Fold in one tick; True the tick the gate trips."""
+        if not self.enabled or self.tripped:
+            return False
+        try:
+            speed = abs(float(commanded_speed))
+            progress = float(progress_m)
+            now = float(now_s)
+        except (TypeError, ValueError):
+            return False
+        if speed != speed or progress != progress or now != now:    # NaN
+            return False
+        if speed < self.min_speed:
+            # Not being asked to move: whatever this is, it is not a stall.
+            self.since_s = None
+            self.reference_m = None
+            return False
+        if (self.reference_m is None
+                or abs(progress - self.reference_m) >= self.min_progress_m):
+            self.since_s = now
+            self.reference_m = progress
+            return False
+        stalled = now - self.since_s
+        if stalled > self.worst_stall_s:
+            self.worst_stall_s = stalled
+        if stalled < self.timeout_s:
+            return False
+        self.tripped = True
+        return True
+
+    def snapshot(self):
+        return {
+            'min_speed': float(self.min_speed),
+            'timeout_s': float(self.timeout_s),
+            'min_progress_m': float(self.min_progress_m),
+            'worst_stall_s': float(self.worst_stall_s),
+            'tripped': bool(self.tripped),
+        }
+
+
 class RouteModel(object):
     """The segment table plus lookup, override and gating helpers."""
 

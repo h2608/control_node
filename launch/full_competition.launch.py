@@ -140,9 +140,24 @@ def stage5_profile_files():
         "'stage5_physical.yaml' if '", LaunchConfiguration('platform'),
         "' == 'real' else ('stage5_sim_odometry.yaml' if '",
         LaunchConfiguration('stage5_profile'),
-        "' == 'sim_depth' else ('stage5_physical.yaml' if '",
+        "' in ('sim_depth', 'sim_physical') else ('stage5_physical.yaml' if '",
         LaunchConfiguration('stage5_profile'),
         "' == 'physical' else 'stage5_sim.yaml'))",
+    ])
+    # ``sim_physical`` is a fourth link in the chain (sim -> sim_odometry ->
+    # sim_depth -> sim_physical), so it needs a slot of its own.  Every other
+    # profile re-loads ``middle`` here, which is a no-op: parameter files are
+    # applied in order and loading the same one twice cannot change a value.
+    third = PythonExpression([
+        "'stage5_sim_depth.yaml' if ('", LaunchConfiguration('platform'),
+        "' != 'real' and '", LaunchConfiguration('stage5_profile'),
+        "' == 'sim_physical') else ('stage5_physical.yaml' if '",
+        LaunchConfiguration('platform'),
+        "' == 'real' else ('stage5_sim_odometry.yaml' if '",
+        LaunchConfiguration('stage5_profile'),
+        "' == 'sim_depth' else ('stage5_physical.yaml' if '",
+        LaunchConfiguration('stage5_profile'),
+        "' == 'physical' else 'stage5_sim.yaml')))",
     ])
     overlay = PythonExpression([
         "'stage5_physical.yaml' if '", LaunchConfiguration('platform'),
@@ -151,7 +166,7 @@ def stage5_profile_files():
     ])
     return [
         PathJoinSubstitution([FindPackageShare('control_node'), 'config', name])
-        for name in (base, middle, overlay)
+        for name in (base, middle, third, overlay)
     ]
 
 
@@ -340,8 +355,12 @@ def generate_launch_description():
             default_value='sim',
             description='Stage 5 parameter profile: sim (Gazebo-tuned, '
                         'yellow-driven), sim_odometry (Gazebo-tuned, odometry '
-                        'segment ends, no yellow in the control loop) or '
-                        'physical (fail-safe placeholders, must be recalibrated)',
+                        'segment ends, no yellow in the control loop), '
+                        'sim_depth (+ depth deck-centring), sim_physical '
+                        '(sim_depth retuned for race_physical.world, where the '
+                        'yellow borders are ground tape and the ring rails are '
+                        'really 0.49 m wide) or physical (fail-safe '
+                        'placeholders, must be recalibrated)',
         ),
         stage_node(1),
         stage_node(2, {
