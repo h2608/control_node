@@ -91,6 +91,28 @@ def stage_node(n, extra_params=None, extra_param_files=None):
         'real_motion_servo_cmd_topic': LaunchConfiguration('real_motion_servo_cmd_topic'),
         'real_motion_servo_response_topic': LaunchConfiguration('real_motion_servo_response_topic'),
         'real_motion_result_service': LaunchConfiguration('real_motion_result_service'),
+        # Raw-image ingestion policy and the RGB-dropout bisect switches.  See
+        # RGB_DROPOUT_INVESTIGATION.md for the intended test order.
+        'raw_rgb_subscription': LaunchConfiguration('raw_rgb_subscription'),
+        'raw_depth_subscription': LaunchConfiguration('raw_depth_subscription'),
+        'image_qos_depth': ParameterValue(
+            LaunchConfiguration('image_qos_depth'), value_type=int),
+        'raw_resubscribe_after_sec': ParameterValue(
+            LaunchConfiguration('raw_resubscribe_after_sec'), value_type=float),
+        'tf_listener_enabled': ParameterValue(
+            LaunchConfiguration('tf_listener_enabled'), value_type=bool),
+        'stage_backend_enabled': ParameterValue(
+            LaunchConfiguration('stage_backend_enabled'), value_type=bool),
+        'real_servo_publish_enabled': ParameterValue(
+            LaunchConfiguration('real_servo_publish_enabled'), value_type=bool),
+        'real_result_actions_enabled': ParameterValue(
+            LaunchConfiguration('real_result_actions_enabled'), value_type=bool),
+        'diagnostics_enabled': ParameterValue(
+            LaunchConfiguration('diagnostics_enabled'), value_type=bool),
+        'diag_report_period_sec': ParameterValue(
+            LaunchConfiguration('diag_report_period_sec'), value_type=float),
+        'diag_stall_warn_sec': ParameterValue(
+            LaunchConfiguration('diag_stall_warn_sec'), value_type=float),
     }
     if extra_params:
         params.update(extra_params)
@@ -244,6 +266,86 @@ def generate_launch_description():
             'use_sim_time',
             default_value='true',
             description='Use the Gazebo /clock instead of wall time',
+        ),
+        # ------------------------------------------------------------------
+        # Raw-image ingestion and RGB-dropout bisect switches.
+        # Every one of these defaults to the normal competition behaviour.
+        # ------------------------------------------------------------------
+        DeclareLaunchArgument(
+            'raw_rgb_subscription',
+            default_value='auto',
+            description='Raw RGB ingestion per stage node: auto (on_activation '
+                        'on a real robot, always in sim), always, on_activation '
+                        'or off. Six always-on readers of one raw camera topic '
+                        'is the load this switch removes.',
+        ),
+        DeclareLaunchArgument(
+            'raw_depth_subscription',
+            default_value='auto',
+            description='Raw depth ingestion per stage node; same values as '
+                        'raw_rgb_subscription',
+        ),
+        DeclareLaunchArgument(
+            'image_qos_depth',
+            default_value='0',
+            description='KEEP_LAST depth for raw image subscriptions; '
+                        '0 = auto (1 on a real robot, 5 in sim)',
+        ),
+        DeclareLaunchArgument(
+            'raw_resubscribe_after_sec',
+            default_value='-1.0',
+            description='Rebuild a raw image subscription that has been silent '
+                        'this long; -1 = auto (3 s real, off in sim), 0 = off',
+        ),
+        DeclareLaunchArgument(
+            'tf_listener_enabled',
+            default_value='true',
+            description='Subscribe /tf and /tf_static in each stage node; '
+                        'false is a DDS-load isolation switch and makes '
+                        'get_current_pose() always return None',
+        ),
+        DeclareLaunchArgument(
+            'stage_backend_enabled',
+            default_value='true',
+            description='Create the motion backend when a stage activates. '
+                        'false runs the state machines with no motion backend '
+                        'at all: the robot will NOT move',
+        ),
+        DeclareLaunchArgument(
+            'real_servo_publish_enabled',
+            default_value='true',
+            description='Publish MotionServoCmd START/DATA/END on the physical '
+                        'backend. false keeps the helper node and executor but '
+                        'sends no servo traffic: the robot will NOT walk',
+        ),
+        DeclareLaunchArgument(
+            'real_result_actions_enabled',
+            default_value='true',
+            description='Call MotionResultCmd on the physical backend. false '
+                        'reports every preset action as instantly complete '
+                        'without moving the robot',
+        ),
+        DeclareLaunchArgument(
+            'auto_start',
+            default_value='true',
+            description='Let mission control activate stages. false launches '
+                        'every node but leaves all of them idle',
+        ),
+        DeclareLaunchArgument(
+            'diagnostics_enabled',
+            default_value='true',
+            description='Emit [RXDIAG]/[RXEVENT]/[RXSTALL] receive diagnostics',
+        ),
+        DeclareLaunchArgument(
+            'diag_report_period_sec',
+            default_value='2.0',
+            description='Period of the periodic [RXDIAG] report line',
+        ),
+        DeclareLaunchArgument(
+            'diag_stall_warn_sec',
+            default_value='2.0',
+            description='Silence after which a receive stream is reported as '
+                        'stalled at ERROR level',
         ),
         DeclareLaunchArgument(
             'rgb_topic',
@@ -414,6 +516,8 @@ def generate_launch_description():
                     LaunchConfiguration('start_stage'), value_type=int),
                 'single_stage': ParameterValue(
                     LaunchConfiguration('single_stage'), value_type=bool),
+                'auto_start': ParameterValue(
+                    LaunchConfiguration('auto_start'), value_type=bool),
                 'start_delay_sec': 2.0,
                 'startup_recovery_enabled': ParameterValue(
                     LaunchConfiguration('startup_recovery_enabled'), value_type=bool),

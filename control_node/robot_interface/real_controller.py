@@ -70,6 +70,13 @@ class RealRobotControlAdapter:
         self.action_wait_timeout_s = max(
             0.1, float(gp('real_action_wait_timeout_s').value))
 
+        # Diagnostic gates (see stage_common for why they exist).  Both default
+        # True; a False value only removes outgoing motion traffic.
+        self.servo_publish_enabled = bool(
+            self._optional_param(parent_node, 'real_servo_publish_enabled', True))
+        self.result_actions_enabled = bool(
+            self._optional_param(parent_node, 'real_result_actions_enabled', True))
+
         self.recovery_motion_id = int(gp('real_recovery_motion_id').value)
         self.emergency_motion_id = int(gp('real_emergency_stop_motion_id').value)
         self.lie_down_motion_id = int(gp('real_lie_down_motion_id').value)
@@ -155,6 +162,53 @@ class RealRobotControlAdapter:
         self._servo_starting = False
         self._servo_first_data_logged = False
 
+        # Diagnostic counters.  These are read by the stage node's periodic
+        # [RXDIAG] line so "the 20 Hz Servo stream started here" and "raw RGB
+        # stopped here" land in the same log at the same timestamps.
+        self._servo_tx_start = 0
+        self._servo_tx_data = 0
+        self._servo_tx_end = 0
+        self._servo_rx_response = 0
+        self._result_calls = 0
+
+        if not self.servo_publish_enabled:
+            self.log.warning(
+                '[DIAG_MODE] real_servo_publish_enabled=False: no SERVO '
+                'START/DATA/END will be published; the robot will NOT walk')
+        if not self.result_actions_enabled:
+            self.log.warning(
+                '[DIAG_MODE] real_result_actions_enabled=False: MotionResultCmd '
+                'calls are suppressed and reported as instantly successful; '
+                'the robot will NOT stand, jump or lie down')
+
+    @staticmethod
+    def _optional_param(parent_node, name, default):
+        """Read a parameter that older callers may not have declared."""
+        try:
+            return parent_node.get_parameter(name).value
+        except Exception:
+            return default
+
+    def _note(self, event, detail=''):
+        """Forward a lifecycle marker to the owning stage node, if it has one."""
+        note = getattr(self.node, 'note_stage_event', None)
+        if callable(note):
+            try:
+                note(event, detail)
+            except Exception:
+                pass
+
+    def diagnostics_snapshot(self):
+        with self._lock:
+            return {
+                'servo_tx_start': int(self._servo_tx_start),
+                'servo_tx_data': int(self._servo_tx_data),
+                'servo_tx_end': int(self._servo_tx_end),
+                'servo_rx_resp': int(self._servo_rx_response),
+                'result_calls': int(self._result_calls),
+                'servo_active': bool(self._servo_active),
+            }
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -171,6 +225,11 @@ class RealRobotControlAdapter:
                 self.result_service,
             )
         )
+        self._note('MOTION_IO_EXECUTOR_START',
+                   'servo_publish={} result_actions={} publish_hz={:.1f}'.format(
+                       self.servo_publish_enabled,
+                       self.result_actions_enabled,
+                       self.publish_hz))
 
     def quit(self):
         try:
@@ -197,6 +256,7 @@ class RealRobotControlAdapter:
         except Exception:
             pass
         self._started = False
+        self._note('MOTION_IO_EXECUTOR_STOP')
 
     def _executor_loop(self):
         while self._run_executor:
@@ -244,7 +304,24 @@ class RealRobotControlAdapter:
         msg.step_height = _fit(payload.get('step_height'), 2, default=0.05)
         return msg
 
+    def _count_servo_tx_locked(self, cmd_type):
+        if cmd_type == SERVO_START:
+            self._servo_tx_start += 1
+        elif cmd_type == SERVO_DATA:
+            self._servo_tx_data += 1
+        elif cmd_type == SERVO_END:
+            self._servo_tx_end += 1
+
     def _publish_servo(self, cmd_type, payload_override=None):
+        if not self.servo_publish_enabled:
+            self.log.warning(
+                '[DIAG_MODE] suppressed SERVO cmd_type={}'.format(cmd_type),
+                throttle_duration_sec=5.0)
+            return
+        # Counted after the gate so the diagnostic counters always mean
+        # "frames actually put on the wire".
+        with self._lock:
+            self._count_servo_tx_locked(cmd_type)
         self._servo_pub.publish(
             self._make_servo_msg(cmd_type, payload_override=payload_override))
 
@@ -322,6 +399,24 @@ class RealRobotControlAdapter:
                 self._servo_legacy_gait = int(legacy_gait_id)
                 publish_start = False
 
+        if publish_start and not self.servo_publish_enabled:
+            # Diagnostic mode: there is no motion manager to ACK a START that is
+            # never sent, so do not burn start_ack_timeout_s in the caller's
+            # executor thread.  Report the session as ready; every subsequent
+            # DATA frame is suppressed in _publish_servo().
+            with self._lock:
+                self._servo_starting = False
+                self._servo_data_started = True
+                self._servo_start_time = time.monotonic()
+                self._servo_ready_monotonic_s = self._servo_start_time
+                self._servo_ready_node_time_s = self._node_now_s()
+                self._motion_timer_anchor_node_time_s = self._servo_ready_node_time_s
+            self.log.warning(
+                '[DIAG_MODE] SERVO_START suppressed motion_id={}; session marked '
+                'ready without robot ACK'.format(motion_id))
+            self._note('SERVO_START_SUPPRESSED', 'motion_id={}'.format(motion_id))
+            return True
+
         if publish_start:
             # Every START frame is neutral.  The important part on the physical
             # robot is not a guessed sleep duration: a Servo START sent
@@ -336,6 +431,7 @@ class RealRobotControlAdapter:
                 '[REAL_CTRL] SERVO_START motion_id={} legacy_gait={} repeat={}, '
                 'waiting robot ACK'.format(
                     motion_id, legacy_gait_id, self.start_repeat))
+            self._note('SERVO_START_REQ', 'motion_id={}'.format(motion_id))
 
             for _ in range(self.start_repeat):
                 self._publish_servo(SERVO_START, payload_override=neutral)
@@ -384,6 +480,9 @@ class RealRobotControlAdapter:
                     '[REAL_CTRL] SERVO_START ACK timeout motion_id={} after {:.2f}s; '
                     'DATA will NOT be sent'.format(
                         motion_id, self.start_ack_timeout_s))
+                self._note('SERVO_START_TIMEOUT',
+                           'motion_id={} blocked_s={:.2f}'.format(
+                               motion_id, self.start_ack_timeout_s))
                 return False
 
             # Optional tiny post-ACK delay; default is zero in the real profile.
@@ -403,6 +502,9 @@ class RealRobotControlAdapter:
                 '[REAL_CTRL] SERVO_READY motion_id={} robot_ack=True '
                 'code={} status={} progress={}'.format(
                     motion_id, ack[1], ack[2], ack[3]))
+            self._note('SERVO_ACK',
+                       'motion_id={} blocked_s={:.2f}'.format(
+                           motion_id, time.monotonic() - start_mark))
 
             # Do not wait another timer period for the first DATA.  Publish the
             # current target immediately after the robot has accepted Servo.
@@ -411,6 +513,8 @@ class RealRobotControlAdapter:
                 self._servo_first_data_logged = True
             self.log.info(
                 '[REAL_CTRL] FIRST SERVO_DATA motion_id={}'.format(motion_id))
+            self._note('SERVO_FIRST_DATA',
+                       'motion_id={} hz={:.1f}'.format(motion_id, self.publish_hz))
             return True
 
         return True
@@ -454,6 +558,7 @@ class RealRobotControlAdapter:
             self._servo_ready_node_time_s = None
             self._servo_ready_monotonic_s = None
         self.log.info('[REAL_CTRL] SERVO_END')
+        self._note('SERVO_END')
         return True
 
     def _servo_timer_cb(self):
@@ -482,6 +587,7 @@ class RealRobotControlAdapter:
     def _servo_response_cb(self, msg):
         now = time.monotonic()
         with self._lock:
+            self._servo_rx_response += 1
             self._last_servo_response = msg
             self._last_servo_rx_monotonic_s = now
             # Do not overwrite a discrete action's pseudo response while that
@@ -557,6 +663,23 @@ class RealRobotControlAdapter:
         self.stop_motion()
         legacy_target = (int(legacy_target[0]), int(legacy_target[1]))
 
+        if not self.result_actions_enabled:
+            # Diagnostic mode: report the action as instantly complete so the
+            # calling state machine keeps its normal shape (and Wait_finish does
+            # not block for action_wait_timeout_s) while no motion is requested.
+            with self._lock:
+                self._result_calls += 1
+                self._action_generation += 1
+                self._last_action_target = legacy_target
+                self._last_action_motion_id = int(motion_id)
+                self._set_action_started_locked(legacy_target)
+                self._set_action_completed_locked(legacy_target, True, 0)
+            self.log.warning(
+                '[DIAG_MODE] MotionResultCmd suppressed motion_id={}; reported '
+                'complete without moving'.format(motion_id))
+            self._note('ACTION_SUPPRESSED', 'motion_id={}'.format(motion_id))
+            return True
+
         if not self._result_client.service_is_ready():
             ready = self._result_client.wait_for_service(
                 timeout_sec=self.service_wait_timeout_s)
@@ -580,6 +703,7 @@ class RealRobotControlAdapter:
         request.duration = int(duration)
 
         with self._lock:
+            self._result_calls += 1
             self._action_generation += 1
             generation = self._action_generation
             self._last_action_target = legacy_target
@@ -616,11 +740,14 @@ class RealRobotControlAdapter:
                 '[REAL_CTRL] ACTION done request_motion_id={} response_motion_id={} '
                 'success={} code={}'.format(
                     motion_id, returned_motion_id, success, code))
+            self._note('ACTION_DONE',
+                       'motion_id={} success={}'.format(motion_id, success))
 
         future.add_done_callback(done_cb)
         self.log.info(
             '[REAL_CTRL] ACTION start motion_id={} legacy=({}, {})'.format(
                 motion_id, legacy_target[0], legacy_target[1]))
+        self._note('ACTION_START', 'motion_id={}'.format(motion_id))
         return True
 
     def run_action(self, action_name, wait_finish=True):
@@ -764,6 +891,12 @@ class RealRobotControlAdapter:
         self.log.error(
             '[REAL_CTRL] Wait_finish timeout target=({}, {}) after {:.1f}s'.format(
                 target[0], target[1], self.action_wait_timeout_s))
+        # This call blocked the caller's executor thread for the whole timeout.
+        # On a stage node that is also the thread that takes camera messages, so
+        # it belongs in the correlation timeline.
+        self._note('WAIT_FINISH_TIMEOUT',
+                   'target=({},{}) blocked_s={:.1f}'.format(
+                       target[0], target[1], self.action_wait_timeout_s))
         return False
 
     # ------------------------------------------------------------------

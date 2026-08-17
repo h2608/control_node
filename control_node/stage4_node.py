@@ -28,7 +28,7 @@ from std_msgs.msg import Bool, String
 from control_node.cola_detector import HybridColaDetector
 from control_node.football_vision import detect_football
 from control_node.my_gait import Robot_Ctrl
-from control_node.stage_common import StageNodeBase, clamp
+from control_node.stage_common import StageNodeBase, clamp, image_qos
 from control_node.stage_entry import EntryPoint, StageEntryTable
 from control_node.stage3_node import P3TrackVisionMixin
 from control_node.cyberdog_voice import CyberdogVoicePlayer
@@ -52,7 +52,8 @@ class _Stage4RgbReceiverNode(Node):
     extremely light even while Stage4 control/perception is busy.
     """
 
-    def __init__(self, context, namespace: str, rgb_topic: str):
+    def __init__(self, context, namespace: str, rgb_topic: str,
+                 qos=qos_profile_sensor_data, rx_diag=None):
         # Ignore process-wide launch remaps such as ``__node:=stage4_node``.
         # Otherwise this helper would be renamed to stage4_node too, producing
         # duplicate node/logger names inside the same process.
@@ -66,15 +67,21 @@ class _Stage4RgbReceiverNode(Node):
         self._latest_msg = None
         self._seq = 0
         self._last_rx_monotonic_s = None
+        # Diagnostics only.  Counters are advanced from this receiver thread and
+        # read from the Stage4 executor thread; the GIL makes each individual
+        # update atomic, and a torn *report* is acceptable for a log line.
+        self._rx_diag = rx_diag
         self._sub = self.create_subscription(
             Image,
             rgb_topic,
             self._rgb_cb,
-            qos_profile_sensor_data,
+            qos,
         )
 
     def _rgb_cb(self, msg: Image):
         now = time.monotonic()
+        if self._rx_diag is not None:
+            self._rx_diag.record('rgb', now)
         with self._lock:
             self._latest_msg = msg
             self._seq += 1
@@ -1305,7 +1312,27 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
         self._p4_rgb_last_rx_monotonic_s = None
         self._p4_rgb_last_restart_monotonic_s = 0.0
         self._p4_rgb_restart_count = 0
-        self._p4_start_rgb_receiver()
+        # Only from here on may the base class's ingestion policy touch the
+        # dedicated receiver: StageNodeBase.__init__ already ran one policy pass
+        # before these attributes existed.
+        self._p4_rgb_rx_ready = True
+        self._apply_raw_subscriptions(activated=self.active, reason='stage4_init')
+
+    def on_apply_extra_raw_subscriptions(self, want_rgb, want_depth):
+        """Run the dedicated RGB receiver under the shared ingestion policy.
+
+        Stage 4 does not use ``self.rgb_sub``; without this the receiver would
+        keep a full-rate raw RGB reader alive from launch to shutdown no matter
+        what ``raw_rgb_subscription`` says, which is exactly the reader count we
+        are trying to control on the physical robot.
+        """
+        del want_depth
+        if not getattr(self, '_p4_rgb_rx_ready', False):
+            return
+        if want_rgb:
+            self._p4_start_rgb_receiver()
+        else:
+            self._p4_stop_rgb_receiver()
 
     def _p4_rgb_executor_loop(self):
         executor = self._p4_rgb_rx_executor
@@ -1320,11 +1347,15 @@ class Stage4Node(P3TrackVisionMixin, StageNodeBase):
                 break
 
     def _p4_start_rgb_receiver(self):
+        if self._p4_rgb_rx_node is not None:
+            return
         namespace = self.get_namespace()
         self._p4_rgb_rx_node = _Stage4RgbReceiverNode(
             context=self.context,
             namespace=namespace,
             rgb_topic=self.rgb_topic,
+            qos=image_qos(self.image_qos_depth),
+            rx_diag=self.rx_diag,
         )
         self._p4_rgb_rx_executor = SingleThreadedExecutor(context=self.context)
         self._p4_rgb_rx_executor.add_node(self._p4_rgb_rx_node)
