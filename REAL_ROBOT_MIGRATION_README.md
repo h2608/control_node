@@ -276,6 +276,51 @@ ssh -L 8084:127.0.0.1:8084 <user>@<robot-ip>
 `final_yellow.*`、`blue_ball.*`、`white_ball.*` 和 `cola.*` 参数也可用 ROS 参数覆盖。
 
 
+## 第二赛段只读视觉调试
+
+`stage2_vision_preview` 是同一套只读网页工具的第二赛段版本。它订阅
+**左右鱼眼 + 前向 RGB + 深度**，按 `stage2_node` 的检测流程重算一遍，
+把通过与未通过的候选、逐条参数判定和当前阈值画在图上：
+
+* 鱼眼：橙球与蓝球（HSV + 面积 + 圆度 + 宽高比 + 圆/框填充率），
+  叠加侧撞入口居中窗口、撞击半径圆环、接近 vx 的实时计算；
+* RGB：橙球与蓝球（HSV + 面积 + 深度取样）以及黄色停止线
+  （ROI + HSV + 横线三条件），叠加中线对齐、左侧近球避让、
+  各巡航子阶段的黄线触发/减速比例线；
+* 另有四宫格颜色掩膜与深度图，便于确认 HSV 区间是否合适。
+
+它同样不创建控制器、不发送任何运动命令。两点与 `stage2_node` 的差异，
+页面上也有标注：鱼眼蓝球检测是本工具额外加的观察项
+（`stage2_node` 的鱼眼只打橙球，用 `fisheye_blue_min_contour_area` 单独控制），
+黄线则同时给出 strict（要求前方横线）和 loose（只看面积）两套选择结果，
+对应 `stage2_node` 里按状态切换的那个开关。
+
+```bash
+cd <control_node 项目目录>
+python3 control_node/stage2_vision_preview.py \
+  --platform real \
+  --dog-ns mi_desktop_48_b0_2d_7b_00_e2 \
+  --port 8082 \
+  --ros-args --params-file config/real_robot.yaml
+
+# 已经 colcon 安装后：
+ros2 run control_node stage2_vision_preview --platform real --port 8082
+
+# 仿真（默认订阅 /image_left、/image_right 与 Gazebo 的 RGB/深度）：
+python3 control_node/stage2_vision_preview.py --platform sim --dog-ns / --port 8082
+```
+
+SSH 转发同上（把 8084 换成 8082），然后打开 `http://127.0.0.1:8082/`。
+话题可用 `--rgb-topic`、`--depth-topic`、`--fisheye-left`、`--fisheye-right`
+覆盖；检测参数名与 `stage2_node` 完全一致（`orange_*`、`blue_*`、`fisheye_*`、
+`yellow_*`、`center_*`、`stage2_left_ball_avoid_*` 等），可以直接复用同一个
+`--params-file`。图上的文字全部是 ASCII：OpenCV 的 `putText` 画不出中文，
+中文只出现在网页与终端里。
+
+如果鱼眼画面本身接近灰度，页面会直接给出警告——HSV 颜色检测在灰度图上
+不可能有结果，先确认相机输出的是彩色图再调阈值。
+
+
 ## Physical camera topics
 
 The real backend now selects the verified camera topics automatically when

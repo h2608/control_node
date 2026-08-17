@@ -24,6 +24,7 @@ setup(
         'console_scripts': [
             'stage1_node = control_node.stage1_node:main',
             'stage2_node = control_node.stage2_node:main',
+            'stage2_vision_preview = control_node.stage2_vision_preview:main',
             'stage3_node = control_node.stage3_node:main',
             'stage4_node = control_node.stage4_node:main',
             'stage4_vision_preview = control_node.stage4_vision_preview:main',
