@@ -47,6 +47,41 @@ def p1_entry_table():
     ))
 
 
+def p1_cruise_velocity(
+        lateral_force, vision_age, *, timeout_s, hold_s, decay_s,
+        blind_min_speed, base_speed, min_speed, kp_turn, kp_lat,
+        kd_slowdown, max_turn, max_lat):
+    """巡航速度：新鲜帧正常纠偏，断流后短暂保持再把 vx 斜坡降下来。
+
+    纯函数，不依赖 ROS，便于单元测试。返回 (vx, vy, wz, mode)，
+    mode 为 'fresh' / 'hold' / 'decay'：
+
+    - fresh：vision_age 在超时内，按 lateral_force 纠偏（原有行为不变）。
+    - hold：刚断流的 hold_s 内，沿用最后一次纠偏值，不加速。
+    - decay：断流超过 hold_s，停止盲转向，vx 在 decay_s 内线性降到
+      blind_min_speed。
+
+    断流时的速度上界永远是"当前纠偏后的速度"，绝不会回到 base_speed —
+    旧实现在断流时给的是 base_speed，比正常纠偏还快，方向也无人修正。
+    """
+    err = float(lateral_force)
+    wz = clamp(err * kp_turn, -max_turn, max_turn)
+    vy = clamp(err * kp_lat, -max_lat, max_lat)
+    vx = max(min_speed, base_speed - abs(err) * kd_slowdown)
+
+    if vision_age < timeout_s:
+        return vx, vy, wz, 'fresh'
+
+    blind_age = vision_age - timeout_s
+    if blind_age < hold_s:
+        return vx, vy, wz, 'hold'
+
+    ramp_age = blind_age - hold_s
+    frac = 1.0 if decay_s <= 0.0 else clamp(ramp_age / decay_s, 0.0, 1.0)
+    vx = vx + (blind_min_speed - vx) * frac
+    return vx, 0.0, 0.0, 'decay'
+
+
 class Stage1Node(StageNodeBase):
 
     STAGE_ID = 1
@@ -74,6 +109,12 @@ class Stage1Node(StageNodeBase):
         self.declare_parameter('p1_max_turn_speed', 0.15)
         self.declare_parameter('p1_max_lateral_speed', 0.15)
         self.declare_parameter('p1_vision_timeout_sec', 1.0)
+        # 视觉断流后的降级巡航：先短暂沿用最后一次纠偏，再把 vx 斜坡降到爬行速度。
+        # 实测物理机 image_rgb 会出现 0.5-1.0 s 的常规空档，最差一次 6 s 只来了 1 帧，
+        # 所以断流时绝不能按 base_forward_speed 全速盲走（那比正常纠偏还快）。
+        self.declare_parameter('p1_vision_hold_sec', 0.5)
+        self.declare_parameter('p1_vision_blind_decay_sec', 1.0)
+        self.declare_parameter('p1_vision_blind_min_speed', 0.0)
 
         self.declare_parameter('p1_brake_duration_sec', 0.3)
         self.declare_parameter('p1_align_max_duration_sec', 3.0)
@@ -149,6 +190,12 @@ class Stage1Node(StageNodeBase):
         self.p1_max_turn_speed = float(self.get_parameter('p1_max_turn_speed').value)
         self.p1_max_lateral_speed = float(self.get_parameter('p1_max_lateral_speed').value)
         self.p1_vision_timeout_sec = float(self.get_parameter('p1_vision_timeout_sec').value)
+        self.p1_vision_hold_sec = max(
+            0.0, float(self.get_parameter('p1_vision_hold_sec').value))
+        self.p1_vision_blind_decay_sec = max(
+            0.0, float(self.get_parameter('p1_vision_blind_decay_sec').value))
+        self.p1_vision_blind_min_speed = max(
+            0.0, float(self.get_parameter('p1_vision_blind_min_speed').value))
 
         self.p1_brake_duration_sec = float(self.get_parameter('p1_brake_duration_sec').value)
         self.p1_align_max_duration_sec = float(self.get_parameter('p1_align_max_duration_sec').value)
@@ -496,16 +543,24 @@ class Stage1Node(StageNodeBase):
                 self.set_state('P1_BRAKE_BUFFER')
                 return
 
-            if now - self.p1_last_update_time < self.p1_vision_timeout_sec:
-                err = self.p1_lateral_force
-                turn_speed = clamp(err * self.p1_kp_turn, -self.p1_max_turn_speed, self.p1_max_turn_speed)
-                lateral_speed = clamp(err * self.p1_kp_lat, -self.p1_max_lateral_speed, self.p1_max_lateral_speed)
-                speed_drop = abs(err) * self.p1_kd_slowdown
-                forward_speed = max(self.p1_min_forward_speed, self.p1_base_forward_speed - speed_drop)
-            else:
-                forward_speed = self.p1_base_forward_speed
-                lateral_speed = 0.0
-                turn_speed = 0.0
+            vision_age = now - self.p1_last_update_time
+            forward_speed, lateral_speed, turn_speed, vision_mode = p1_cruise_velocity(
+                self.p1_lateral_force, vision_age,
+                timeout_s=self.p1_vision_timeout_sec,
+                hold_s=self.p1_vision_hold_sec,
+                decay_s=self.p1_vision_blind_decay_sec,
+                blind_min_speed=self.p1_vision_blind_min_speed,
+                base_speed=self.p1_base_forward_speed,
+                min_speed=self.p1_min_forward_speed,
+                kp_turn=self.p1_kp_turn, kp_lat=self.p1_kp_lat,
+                kd_slowdown=self.p1_kd_slowdown,
+                max_turn=self.p1_max_turn_speed,
+                max_lat=self.p1_max_lateral_speed)
+            if vision_mode != 'fresh':
+                self.get_logger().warn(
+                    f'[P1] 视觉断流 {vision_age:.2f}s（mode={vision_mode}），'
+                    f'降级巡航 vx={forward_speed:.3f}',
+                    throttle_duration_sec=0.5)
 
             self.p1_send_velocity_command(
                 forward_speed, lateral_speed, turn_speed,
