@@ -425,3 +425,115 @@ def test_a_wrong_declared_width_biases_the_centre_by_half_the_error():
     # therefore pushes the inferred centre 0.05 m away from that edge — and a
     # perfectly centred robot is told it is 0.05 m off.
     assert result['lateral_offset'] == pytest.approx(0.05, abs=0.03)
+
+
+# --- forward drop-off: body-axis corridor fallback -----------------------
+
+
+def _deck_cloud(deck_end_x=2.0, drop=0.4, center_y=0.0):
+    """Flat deck out to ``deck_end_x``, then floor ``drop`` below it."""
+    xs = np.arange(0.5, 3.5, 0.05)
+    ys = np.arange(-0.2, 0.21, 0.05) + center_y
+    pts = []
+    for x in xs:
+        for y in ys:
+            pts.append((x, y, 0.0 if x <= deck_end_x else -drop))
+    return np.asarray(pts, dtype=float)
+
+
+PLANE = {'a': 0.0, 'b': 0.0, 'c': 0.0}
+VALID_EDGES = {'valid': True, 'centerline_slope': 0.0,
+               'centerline_intercept': 0.0}
+BROKEN_EDGES = {'valid': False}
+
+
+def test_dropoff_still_refuses_broken_edges_by_default():
+    """The fallback is opt-in: default behaviour must be unchanged."""
+    from control_node.bridge_perception import detect_forward_dropoff
+    out = detect_forward_dropoff(
+        _deck_cloud(), PLANE, BROKEN_EDGES, BridgePerceptionConfig())
+    assert out['reason'] == 'invalid_edges'
+    assert out['deck_end_x'] is None
+
+
+def test_dropoff_finds_the_deck_end_with_valid_edges():
+    """Baseline the fallback has to match."""
+    from control_node.bridge_perception import detect_forward_dropoff
+    out = detect_forward_dropoff(
+        _deck_cloud(deck_end_x=2.0), PLANE, VALID_EDGES,
+        BridgePerceptionConfig())
+    assert out['reason'] == 'ok'
+    assert out['dropoff_detected'] is True
+    assert out['deck_end_x'] == pytest.approx(2.0, abs=0.06)
+
+
+def test_body_axis_fallback_recovers_the_same_deck_end():
+    """With edges broken but the body pointing down the deck, same answer."""
+    from control_node.bridge_perception import detect_forward_dropoff
+    cfg = BridgePerceptionConfig(dropoff_body_axis_fallback=True)
+    out = detect_forward_dropoff(
+        _deck_cloud(deck_end_x=2.0), PLANE, BROKEN_EDGES, cfg)
+    assert out['reason'] == 'ok_body_axis'
+    assert out['dropoff_detected'] is True
+    assert out['deck_end_x'] == pytest.approx(2.0, abs=0.06)
+
+
+def test_body_axis_fallback_is_labelled_so_consumers_can_tell():
+    """A weaker measurement must not be indistinguishable from a strong one."""
+    from control_node.bridge_perception import detect_forward_dropoff
+    cfg = BridgePerceptionConfig(dropoff_body_axis_fallback=True)
+    strong = detect_forward_dropoff(_deck_cloud(), PLANE, VALID_EDGES, cfg)
+    weak = detect_forward_dropoff(_deck_cloud(), PLANE, BROKEN_EDGES, cfg)
+    assert strong['reason'] == 'ok'
+    assert weak['reason'] == 'ok_body_axis'
+
+
+def test_body_axis_fallback_reads_early_when_the_deck_is_offset():
+    """The documented failure direction, pinned so it cannot drift.
+
+    A deck whose centreline is offset from the body axis is sampled by a
+    corridor that clips its edge, so the fallback sees the deck end no later
+    than it really is.  Early is the safe direction for a corner trigger.
+    """
+    from control_node.bridge_perception import detect_forward_dropoff
+    cfg = BridgePerceptionConfig(dropoff_body_axis_fallback=True)
+    offset = detect_forward_dropoff(
+        _deck_cloud(deck_end_x=2.0, center_y=0.25), PLANE, BROKEN_EDGES, cfg)
+    if offset['deck_end_x'] is not None:
+        assert offset['deck_end_x'] <= 2.0 + 1e-6
+
+
+def test_body_axis_fallback_yields_a_usable_forward_distance():
+    """The fallback is useless unless it produces a *distance*, not just an x.
+
+    `d_forward_dropoff` was previously computed only when the two-sided edge
+    fit succeeded, so on the ring rails — where that fit lands on 12-40% of
+    frames — the one course-referenced measurement that could trigger a corner
+    was never populated. This pins the fallback path end to end.
+    """
+    from control_node.bridge_perception import detect_forward_dropoff
+    cfg = BridgePerceptionConfig(dropoff_body_axis_fallback=True)
+    out = detect_forward_dropoff(
+        _deck_cloud(deck_end_x=2.0), PLANE, BROKEN_EDGES, cfg)
+    assert out['reason'] == 'ok_body_axis'
+    assert out['dropoff_detected'] is True
+    # The consumer measures from its control point, not from the camera.
+    control_point_x = 0.35
+    distance = out['deck_end_x'] - control_point_x
+    assert distance == pytest.approx(2.0 - control_point_x, abs=0.06)
+    assert distance > 0.0
+
+
+def test_no_dropoff_means_no_distance_not_a_zero():
+    """An undetected drop-off must read as unknown, never as 'right here'.
+
+    A zero here would trigger a corner immediately; None cannot be mistaken
+    for a measurement.
+    """
+    from control_node.bridge_perception import detect_forward_dropoff
+    cfg = BridgePerceptionConfig(dropoff_body_axis_fallback=True)
+    # A deck with no drop at all: the corridor never falls away.
+    flat = _deck_cloud(deck_end_x=99.0)
+    out = detect_forward_dropoff(flat, PLANE, BROKEN_EDGES, cfg)
+    assert out['dropoff_detected'] is False
+    assert out.get('deck_end_x') is None or out['deck_end_x'] > 3.0

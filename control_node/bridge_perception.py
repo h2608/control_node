@@ -106,6 +106,8 @@ class BridgePerceptionConfig:
         # 透视射线在桥面后落到低地时，前向坐标间隔可显著大于真实落差边界.
         self.dropoff_evidence_max_gap = 0.80
         self.dropoff_min_below_points = 3
+        # 边缘拟合失败时，是否退回“沿机体前向轴”取走廊。
+        self.dropoff_body_axis_fallback = False
 
         for key, value in overrides.items():
             if not hasattr(self, key):
@@ -602,17 +604,46 @@ def extract_single_sided_edge(
 
 
 def detect_forward_dropoff(points, plane, edges, config):
-    """沿估计桥中心线走廊寻找桥面末端及紧随其后的真实低点."""
-    if not edges.get('valid', False):
+    """沿估计桥中心线走廊寻找桥面末端及紧随其后的真实低点.
+
+    The corridor only has to point roughly where the robot is going, and the
+    two-sided edge fit is a much stronger thing to demand than that: on the
+    ring rails it succeeds on 12-40% of frames, so "how far ahead does the deck
+    end" — the one course-referenced measurement that could trigger a corner on
+    the course rather than on accumulated odometry — is unavailable exactly
+    where it is most wanted.  With ``dropoff_body_axis_fallback`` the corridor
+    falls back to the body's own forward axis (y = 0), which is where the robot
+    is heading by definition.
+
+    The fallback is reported as ``ok_body_axis`` rather than ``ok`` because it
+    is a weaker measurement and a consumer may reasonably want to know: a body
+    yawed relative to the deck samples a corridor that walks off the centreline
+    the further ahead it looks, so it reads the deck ending **early**.
+
+    That under-read is a bias to calibrate out, not a safety margin.  Measured:
+    a corner trigger set at 1.10 m fired 0.26 m before the course-referenced
+    point, putting the corner-2 take-off at x = -0.03 against a usable window
+    of -0.22 to -0.37, and the jump failed on both runs that reached it.  Early
+    leaves the window on the near side exactly as fatally as late leaves it on
+    the far side.  What the reading *is* good for is repeatability: with the
+    bias calibrated out, the same trigger cut the take-off spread from 0.116 m
+    to 0.075 m, which accumulated odometry cannot do at any segment length.
+    """
+    edges_valid = bool(edges.get('valid', False))
+    if not edges_valid and not config.dropoff_body_axis_fallback:
         return {'deck_end_x': None, 'dropoff_detected': False,
                 'reason': 'invalid_edges'}
-    center_y = (
-        edges['centerline_slope'] * points[:, 0]
-        + edges['centerline_intercept']
-    )
+    if edges_valid:
+        center_y = (
+            edges['centerline_slope'] * points[:, 0]
+            + edges['centerline_intercept']
+        )
+    else:
+        center_y = np.zeros(points.shape[0])
     corridor = points[
         np.abs(points[:, 1] - center_y) <= config.dropoff_lateral_half_width
     ]
+    ok_reason = 'ok' if edges_valid else 'ok_body_axis'
     if corridor.shape[0] == 0:
         return {'deck_end_x': None, 'dropoff_detected': False,
                 'reason': 'no_corridor_points'}
@@ -640,7 +671,7 @@ def detect_forward_dropoff(points, plane, edges, config):
     return {
         'deck_end_x': end_x,
         'dropoff_detected': bool(dropoff),
-        'reason': 'ok',
+        'reason': ok_reason,
         'below_evidence_points': int(evidence.size),
     }
 
@@ -742,6 +773,16 @@ def bridge_observation(
             (end_x - float(control_point_x)) * unit_x
             + (end_y - float(control_point_y)) * unit_y
         )
+    elif dropoff['dropoff_detected'] and dropoff['reason'] == 'ok_body_axis':
+        # No centreline to project onto, because the edge fit is what failed.
+        # The body's own forward axis is the reference instead, so the distance
+        # is just the deck end's x — which is the whole point of the fallback:
+        # "how far ahead does the deck end" is answerable without knowing where
+        # its sides are, and on the ring rails the sides are exactly what the
+        # observer cannot see (a two-sided fit lands on 12-40% of frames).
+        end_x = float(dropoff['deck_end_x'])
+        d_forward_camera = end_x
+        d_forward_control = end_x - float(control_point_x)
 
     result = {
         **metadata,
