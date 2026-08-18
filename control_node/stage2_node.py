@@ -853,7 +853,6 @@ class Stage2Node(StageNodeBase):
         self.last_hit_side: Optional[str] = None
         self.side_shift_done: bool = False
 
-
         # 第一、第三巡航阶段分别记录已经成功撞过橙球的鱼眼侧。
         # 同一阶段内每侧最多只有一个橙球；撞完后不再处理该侧，
         # 但第一阶段的记录不会影响第三阶段。

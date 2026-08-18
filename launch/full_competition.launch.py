@@ -220,10 +220,10 @@ def generate_launch_description():
         stage_entry_argument(1, 'start, cruise, brake, align, restore, forward, '
                                 'turn, ball, shift'),
         stage_entry_argument(2, 'start, track1, track1_exit, track1_turn, '
-                                'track1_shift, track2, track2_turn, '
-                                'track2_forward, track3, scan, scan_hit, '
-                                'turn_back, final, final_forward, final_turn, '
-                                'final_align, ball_align, ball_hit, ball_shift'),
+                                'track1_shift, track2, track2_shift, '
+                                'track2_turn, track3, turn_back, final, '
+                                'final_forward, final_turn, final_align, '
+                                'ball_align, ball_hit, ball_shift'),
         stage_entry_argument(3, 'start, s_curve, align'),
         stage_entry_argument(4, 'start, search, bar_center, bar, bar_target, '
                                 'bar_hit, bar_back, bar_yellow, '

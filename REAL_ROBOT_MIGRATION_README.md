@@ -173,7 +173,7 @@ ros2 launch control_node full_competition.launch.py \
 | 赛段 | 入口名 |
 | --- | --- |
 | 1 | `start` `cruise` `brake` `align` `restore` `forward` `turn` `ball` `shift` |
-| 2 | `start` `track1` `track1_exit` `track1_turn` `track1_shift` `track2` `track2_turn` `track2_forward` `track3` `scan` `scan_hit` `turn_back` `final` `final_forward` `final_turn` `final_align` `ball_align` `ball_hit` `ball_shift` |
+| 2 | `start` `track1` `track1_exit` `track1_turn` `track1_shift` `track2` `track2_shift` `track2_turn` `track3` `turn_back` `final` `final_forward` `final_turn` `final_align` `ball_align` `ball_hit` `ball_shift` |
 | 3 | `start` `s_curve` `align` |
 | 4 | `start` `search` `bar_center` `bar` `bar_target` `bar_hit` `bar_back` `bar_yellow` `obstacle_center` `obstacle` `obstacle_route` `target` `target_hit` `upright` `post_hit` `post_hit_obstacle` `final` `final_yellow` `final_align` |
 | 5 | `start` `recovery` `align` `step_up` `ramp` `ramp_exit` `corner_1` `slope_body` `straight_1` `corner_2` `straight_2` `corner_3` `straight_3` `reset_body` `corner_4` `descent` `final` `final_jump` |
