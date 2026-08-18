@@ -12,11 +12,13 @@
 因此赛段节点晚启动也能收到当前激活状态。
 """
 
+import time
+
 import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
-from std_msgs.msg import Int32
+from std_msgs.msg import Int32, String
 
 
 def latched_qos(depth: int = 1) -> QoSProfile:
@@ -70,6 +72,11 @@ class MissionControlNode(Node):
         self.declare_parameter('mission_active_topic', '/mission/active_stage')
         self.declare_parameter('mission_complete_topic', '/mission/stage_complete')
         self.declare_parameter('mission_inactive_topic', '/mission/stage_inactive')
+        # Mission control writes its own markers into the shared diagnostic
+        # event stream so ``ros2 topic echo /mission/diag/event`` shows the
+        # startup order of all seven control processes in one place.
+        self.declare_parameter('diag_event_topic_enabled', True)
+        self.declare_parameter('diag_event_topic', '/mission/diag/event')
 
         # Physical-robot startup barrier.  This is owned by MissionControl so
         # it runs exactly once before whichever stage is selected as the start.
@@ -126,6 +133,14 @@ class MissionControlNode(Node):
             self.get_parameter('real_motion_result_service').value)
         self.real_cmd_source = int(self.get_parameter('real_cmd_source').value)
 
+        self.diag_event_pub = None
+        if bool(self.get_parameter('diag_event_topic_enabled').value):
+            self.diag_event_pub = self.create_publisher(
+                String,
+                str(self.get_parameter('diag_event_topic').value),
+                signal_qos(20))
+        self._last_published_active = None
+
         self.active_pub = self.create_publisher(Int32, self.mission_active_topic, latched_qos(1))
         self.complete_sub = self.create_subscription(
             Int32, self.mission_complete_topic, self.stage_complete_callback, latched_qos(6))
@@ -169,6 +184,15 @@ class MissionControlNode(Node):
             f'single_stage={self.single_stage}, '
             f'startup_recovery={self.startup_recovery_enabled}'
         )
+        self.note_event(
+            'MISSION_NODE_READY',
+            'auto_start={} startup_recovery={} sequence={}'.format(
+                self.auto_start, self.startup_recovery_enabled,
+                self.stage_sequence))
+        if not self.auto_start:
+            self.get_logger().warn(
+                '[DIAG_MODE] auto_start=False: no stage will be activated; '
+                'every stage node stays idle')
 
     def now_sec(self) -> float:
         return self.get_clock().now().nanoseconds / 1e9
@@ -178,10 +202,30 @@ class MissionControlNode(Node):
             return None
         return self.stage_sequence[self.seq_index]
 
+    def note_event(self, event: str, detail: str = ''):
+        """Emit one lifecycle marker on the shared diagnostic event stream."""
+        line = '[RXEVENT] node=mission_control t={:.3f} ev={}'.format(
+            time.monotonic(), event)
+        if detail:
+            line += ' detail={}'.format(detail)
+        self.get_logger().warn(line)
+        if self.diag_event_pub is not None:
+            out = String()
+            out.data = line
+            try:
+                self.diag_event_pub.publish(out)
+            except Exception:
+                pass
+
     def publish_active(self, stage: int):
         msg = Int32()
         msg.data = int(stage)
         self.active_pub.publish(msg)
+        # tick() republishes the same value every period; only the transitions
+        # are worth a marker.
+        if self._last_published_active != int(stage):
+            self._last_published_active = int(stage)
+            self.note_event('PUBLISH_ACTIVE_STAGE', 'stage={}'.format(int(stage)))
 
     @staticmethod
     def _set_request_field_if_present(request, name, value):
@@ -259,6 +303,8 @@ class MissionControlNode(Node):
             self.get_logger().info(
                 '[MISSION] startup: sent recovery stand motion_id={} ONCE'.format(
                     self.startup_recovery_motion_id))
+            self.note_event('STARTUP_RECOVERY_SENT', 'motion_id={}'.format(
+                self.startup_recovery_motion_id))
             return False
 
         if (
@@ -293,6 +339,7 @@ class MissionControlNode(Node):
         self.get_logger().info(
             '[MISSION] startup recovery success: response_motion_id={} code={}'.format(
                 returned_motion_id, code))
+        self.note_event('STARTUP_RECOVERY_DONE', 'code={}'.format(code))
         return False
 
     def tick(self):
