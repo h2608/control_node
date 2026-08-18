@@ -136,8 +136,21 @@ def test_stage4_table_states_are_the_legacy_valid_states():
     assert list(table.state_names()) == Stage4Node.get_all_state_names()
 
 
-def test_stage6_test_mode_moves_the_default_start():
-    assert p6_entry_table().start_state == 'BLIND_MARCH'
-    assert p6_entry_table('NORTHWARD_MARCH').start_state == 'NORTHWARD_MARCH'
-    # 具名入口不随之改变：start 始终是完整流程的起点。
-    assert p6_entry_table('NORTHWARD_MARCH').resolve('start').state == 'BLIND_MARCH'
+def test_stage6_table_matches_the_deployed_state_machine():
+    """第六赛段入口表必须描述机器人上实际跑的状态机。
+
+    2026-08-16 机器人上的改版删掉了 p6_north_align_test_only 这条调试路径，
+    连同它的终点 P6_TEST_HOLD；起点从 BLIND_MARCH 改成 NORTHWARD_MARCH，
+    CLEAR_BALL_TURN 被 POST_TURN_CRAB / EASTWARD_BLIND_MARCH / PUSH_SETUP_TURN
+    取代。入口表如果还描述旧状态，stage6_entry:= 就会指向不存在的状态。
+    """
+    table = p6_entry_table()
+    states = set(table.state_names())
+
+    assert table.start_state == 'NORTHWARD_MARCH'
+    assert table.resolve('start').state == 'NORTHWARD_MARCH'
+
+    for gone in ('BLIND_MARCH', 'CLEAR_BALL_TURN', 'P6_TEST_HOLD'):
+        assert gone not in states, gone
+    for added in ('POST_TURN_CRAB', 'EASTWARD_BLIND_MARCH', 'PUSH_SETUP_TURN'):
+        assert added in states, added

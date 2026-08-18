@@ -196,6 +196,10 @@ class StageNodeBase(Node):
         self.declare_parameter('real_legacy_gait1_motion_id', 303)
         self.declare_parameter('real_legacy_gait3_motion_id', 303)
         self.declare_parameter('real_legacy_gait27_motion_id', 303)
+        # Stage 6 pushes the ball with legacy gait 28 -> real servo 308
+        # (medium speed).  Declared here because the robot's real_robot.yaml
+        # sets it, and an undeclared key in a params file fails node startup.
+        self.declare_parameter('real_legacy_gait28_motion_id', 308)
 
         self.rgb_topic = str(self.get_parameter('rgb_topic').value)
         self.depth_topic = str(self.get_parameter('depth_topic').value)

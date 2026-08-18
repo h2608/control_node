@@ -183,3 +183,5 @@
     real_legacy_gait1_motion_id: 303
     real_legacy_gait3_motion_id: 303
     real_legacy_gait27_motion_id: 303
+    # Dedicated Stage-6 lateral ball-clear gait; all existing gait IDs stay slow.
+    real_legacy_gait28_motion_id: 308

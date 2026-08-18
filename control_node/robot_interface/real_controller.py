@@ -82,6 +82,7 @@ class RealRobotControlAdapter:
             1: int(gp('real_legacy_gait1_motion_id').value),
             3: int(gp('real_legacy_gait3_motion_id').value),
             27: int(gp('real_legacy_gait27_motion_id').value),
+            28: int(gp('real_legacy_gait28_motion_id').value),
         }
 
         # Servo target/lifecycle.
@@ -163,9 +164,34 @@ class RealRobotControlAdapter:
             return
         self._started = True
         self._executor_thread.start()
+
+        # CycloneDDS discovery on the CyberDog's Jetson can take several
+        # seconds, especially while several Python ROS nodes are starting.
+        # Publishing the short Stage-6 blind-march before motion_manager has
+        # matched this publisher silently drops the entire movement.  Wait for
+        # the physical subscriber before allowing the stage clock to start.
+        discovery_deadline = time.monotonic() + 20.0
+        warned = False
+        while (self._servo_pub.get_subscription_count() < 1 and
+               time.monotonic() < discovery_deadline):
+            if not warned:
+                self.log.info(
+                    '[REAL_CTRL] waiting for motion_manager DDS discovery')
+                warned = True
+            time.sleep(0.1)
+        if self._servo_pub.get_subscription_count() < 1:
+            self._started = False
+            self._run_executor = False
+            raise RuntimeError(
+                'motion_manager did not subscribe to {} within 20s'.format(
+                    self.servo_cmd_topic))
+
+        # Allow endpoint matching to settle before the first short START burst.
+        time.sleep(0.5)
         self.log.info(
-            '[REAL_CTRL] motion backend ready: servo_cmd={}, servo_response={}, '
-            'result_service={}'.format(
+            '[REAL_CTRL] motion backend ready: matched_subscribers={}, '
+            'servo_cmd={}, servo_response={}, result_service={}'.format(
+                self._servo_pub.get_subscription_count(),
                 self.servo_cmd_topic,
                 self.servo_response_topic,
                 self.result_service,
