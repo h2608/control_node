@@ -38,7 +38,7 @@ P2_BALL_SUBCHAIN_STATES = (
 P2_CRUISE_STATES = (
     'STAGE1_CRUISE_BALL_AND_YELLOW',
     'STAGE2_CRUISE_YELLOW_ONLY',
-    'STAGE3_CRUISE_BALL_ONLY',
+    'STAGE3_GO_FINAL',
 )
 
 
@@ -57,13 +57,10 @@ def p2_entry_table():
         # 赛道 2
         'STAGE2_CRUISE_YELLOW_ONLY',
         'STAGE2_ROTATE_LEFT_90',
-        'STAGE2_MOVE_FORWARD_AFTER_LEFT_JUMP',
-        'STAGE2_MOVE_FORWARD_AFTER_LEFT_JUMP_TIME',
-        # 赛道 3
-        'STAGE3_CRUISE_BALL_ONLY',
-        'STAGE3_FINAL_DECISION',
-        'STAGE3_GO_SCAN',
-        'STAGE3_SCAN_AND_HIT_LAST',
+        # 赛道 2 -> 3：第二次90°前先定时左移
+        'STAGE2_LEFT_SHIFT_BEFORE_SECOND_90',
+        # 赛道 3：第二次90°后先不撞球，RGB居中找黄线
+        'STAGE3_PRE180_CENTER_YELLOW',
         'STAGE3_ROTATE_BACK_180',
         'STAGE3_GO_FINAL',
         'STAGE3_FORWARD_AFTER_GO_FINAL',
@@ -82,14 +79,16 @@ def p2_entry_table():
         EntryPoint('track1_shift', 'STAGE1_MOVE_RIGHT_FIXED_DISTANCE',
                    '转向后的定距右横移'),
         EntryPoint('track2', 'STAGE2_CRUISE_YELLOW_ONLY', '赛道 2 巡航（只看黄线）'),
-        EntryPoint('track2_turn', 'STAGE2_ROTATE_LEFT_90', '赛道 2 -> 3 左转 90°'),
-        EntryPoint('track2_forward', 'STAGE2_MOVE_FORWARD_AFTER_LEFT_JUMP',
-                   '赛道 2 转向后的前进'),
-        EntryPoint('track3', 'STAGE3_CRUISE_BALL_ONLY', '赛道 3 巡航（只看橙球）'),
-        EntryPoint('scan', 'STAGE3_GO_SCAN', '赛道 3 末端补扫最后一个球'),
-        EntryPoint('scan_hit', 'STAGE3_SCAN_AND_HIT_LAST', '补扫命中最后一个球'),
-        EntryPoint('turn_back', 'STAGE3_ROTATE_BACK_180', '补扫后掉头 180°'),
-        EntryPoint('final', 'STAGE3_GO_FINAL', '走向出口'),
+        EntryPoint('track2_shift', 'STAGE2_LEFT_SHIFT_BEFORE_SECOND_90',
+                   '第二次90°之前：先定时左移'),
+        EntryPoint('track2_turn', 'STAGE2_ROTATE_LEFT_90',
+                   '左移完成后：原地踏步恢复姿态，再左转90°'),
+        EntryPoint('track3', 'STAGE3_PRE180_CENTER_YELLOW',
+                   '第二次90°后：禁用鱼眼撞球，RGB居中前进并寻找黄线'),
+        EntryPoint('turn_back', 'STAGE3_ROTATE_BACK_180',
+                   '第三条黄线到达后，原地踏步恢复姿态并掉头180°'),
+        EntryPoint('final', 'STAGE3_GO_FINAL',
+                   '180°后：启用鱼眼橙球，同时前进寻找最终黄线'),
         EntryPoint('final_forward', 'STAGE3_FORWARD_AFTER_GO_FINAL', '出口前定时前进'),
         EntryPoint('final_turn', 'STAGE3_ROTATE_LEFT_30', '出口前左转 30°'),
         EntryPoint('final_align', 'STAGE3_FINAL_ROTATE_AFTER_LEFT_SHIFT',
@@ -110,7 +109,43 @@ class Stage2Node(StageNodeBase):
     def __init__(self):
         super().__init__('stage2_node', self.STAGE_ID)
 
-        # 调试入口：可写入口名（track2、scan、final…）或直接写状态名。
+        # =========================
+        # 第二赛段双频控制
+        # =========================
+        # 普通状态只按 5 Hz 执行 stage_control_loop，降低 CPU 压力。
+        # 固定时间原地转向仍需要更细的时间分辨率，因此底层定时器保持 30 Hz；
+        # 进入定时转向状态后不再做 RGB / Depth / 双鱼眼图像转换与检测。
+        self.declare_parameter('stage2_control_hz', 5.0)
+        self.declare_parameter('stage2_timed_turn_control_hz', 30.0)
+        # 需要 RGB 的巡航状态如果连续一段时间没有成功处理新帧，就保持
+        # 连续步态但速度清零，避免相机卡住时继续盲走。
+        self.declare_parameter('stage2_rgb_stale_timeout_s', 0.60)
+        # 5 Hz 普通状态速度已按低频控制下调；连续帧确认阈值也同步缩短。
+        self.stage2_control_hz = max(
+            0.1, float(self.get_parameter('stage2_control_hz').value))
+        self.stage2_timed_turn_control_hz = max(
+            self.stage2_control_hz,
+            float(self.get_parameter('stage2_timed_turn_control_hz').value))
+        self.stage2_control_period_s = 1.0 / self.stage2_control_hz
+        self.stage2_rgb_stale_timeout_s = max(
+            self.stage2_control_period_s,
+            float(self.get_parameter('stage2_rgb_stale_timeout_s').value)
+        )
+        self._stage2_next_low_rate_tick_monotonic: Optional[float] = None
+
+        # StageNodeBase 默认创建 control_timer。第二赛段自己固定以 30 Hz 唤醒，
+        # 再在 stage_control_loop 内把非转向状态节流到 5 Hz。
+        # 这样不会修改公共 StageNodeBase，也不会影响其他赛段。
+        if abs(self.control_hz - self.stage2_timed_turn_control_hz) > 1e-6:
+            self.control_timer.cancel()
+            self.destroy_timer(self.control_timer)
+            self.control_timer = self.create_timer(
+                1.0 / self.stage2_timed_turn_control_hz,
+                self._control_timer_cb
+            )
+        self.control_hz = self.stage2_timed_turn_control_hz
+
+        # 调试入口：可写入口名（track2、final…）或直接写状态名。
         # 统一的 entry_point 参数（launch 里的 stage2_entry）优先于这一个。
         self.declare_parameter('second_stage_initial_state', 'default')
         # 从撞球子链入口启动时，指定打完球回到哪条巡航赛道。
@@ -135,46 +170,37 @@ class Stage2Node(StageNodeBase):
         #
         # STAGE2_CRUISE_YELLOW_ONLY:
         #   第二阶段巡航；主要看黄线，不进入撞球子状态。
-        #   额外检测左侧蓝球/橙球：如果左侧近球靠近图像中心且距离足够近，
-        #   就临时给固定右移 vy，避免机器狗左侧蹭球或撞球。
-        #   黄线达到第二阶段阈值时直接转入 STAGE2_ROTATE_LEFT_90。
+        #   RGB-only 检测危险小球并执行右移避障。
+        #   黄线达到第二阶段阈值后，不立即转向；
+        #   先进入 STAGE2_LEFT_SHIFT_BEFORE_SECOND_90 定时左移。
+        #
+        # STAGE2_LEFT_SHIFT_BEFORE_SECOND_90:
+        #   第二次 90° 左转之前的定时左移。
+        #   该阶段关闭视觉并使用 30 Hz 控制；左移完成后进入
+        #   STAGE2_ROTATE_LEFT_90。
         #
         # STAGE2_ROTATE_LEFT_90:
-        #   第二阶段结束后的左转状态。
-        #   使用固定角速度 + 固定仿真时间代替原地左跳，完成后先进入
-        #   STAGE2_MOVE_FORWARD_AFTER_LEFT_JUMP_TIME，按仿真时间前进固定时长，
-        #   再进入 STAGE3_CRUISE_BALL_ONLY。
+        #   第二阶段结束后的第二次 90° 左转。
+        #   状态内部先原地踏步 timed_turn_pre_stand_duration_sec，
+        #   再按固定角速度 + 固定时间完成 90°。
+        #   完成后进入 STAGE3_PRE180_CENTER_YELLOW。
         #
-        # STAGE2_MOVE_FORWARD_AFTER_LEFT_JUMP_TIME:
-        #   第二阶段左跳完成后，按仿真时间以固定速度向前走固定时长。
-        #   到时后进入 STAGE3_CRUISE_BALL_ONLY。
-        #
-        # STAGE3_CRUISE_BALL_ONLY:
-        #   第三阶段巡航；主要处理橙球，同时继续看黄线。
-        #   发现满足条件的橙球时转入 BALL_LATERAL_ALIGN；
-        #   黄线达到第三阶段阈值时转入 STAGE3_ROTATE_BACK_180。
+        # STAGE3_PRE180_CENTER_YELLOW:
+        #   第二次 90° 后的第三条直道前半段。
+        #   此阶段不启用鱼眼橙球撞击；RGB 仍检测左右参考球用于中线居中，
+        #   同时检测黄线。这里直接复用旧 STAGE3_CRUISE_BALL_ONLY
+        #   原本使用的黄线参数：
+        #   yellow_stop_line_y_ratio_stage3 / yellow_slowdown_ratio_stage3。
+        #   达到黄线后直接进入 STAGE3_ROTATE_BACK_180。
         #
         # STAGE3_ROTATE_BACK_180:
-        #   第三阶段末尾回转状态。
-        #   使用固定角速度 + 固定仿真时间代替两次原地左跳，近似完成 180° 掉头，
-        #   完成后进入 STAGE3_FINAL_DECISION。
-        #
-        # STAGE3_FINAL_DECISION:
-        #   第三阶段末尾决策状态。
-        #   根据 orange_hit_count 判断是否已完成 4 个橙球：
-        #   已完成则进入 STAGE3_GO_FINAL，否则进入 STAGE3_GO_SCAN。
-        #
-        # STAGE3_GO_SCAN:
-        #   前往补扫区域的巡航状态。
-        #   走到 yellow_ratio_scan 对应黄线位置后进入 STAGE3_SCAN_AND_HIT_LAST。
-        #
-        # STAGE3_SCAN_AND_HIT_LAST:
-        #   在补扫区域寻找最后一个橙球。
-        #   找到目标球则进入 BALL_LATERAL_ALIGN，未找到则继续巡航。
+        #   先原地踏步 timed_turn_pre_stand_duration_sec 恢复水平姿态，
+        #   再按固定时间掉头 180°。
+        #   完成后进入 STAGE3_GO_FINAL。
         #
         # STAGE3_GO_FINAL:
-        #   前往最终出口线的巡航状态。
-        #   黄线达到 yellow_ratio_final 后进入 STAGE3_FORWARD_AFTER_GO_FINAL。
+        #   180° 后开始启用鱼眼橙球撞击，同时继续向前寻找最终黄线。
+        #   撞球完成后回到本状态继续前进；最终黄线触发阈值保持 yellow_ratio_final。
         #
         # STAGE3_FORWARD_AFTER_GO_FINAL:
         #   最终出口线后的固定前进状态。
@@ -261,28 +287,29 @@ class Stage2Node(StageNodeBase):
         self.declare_parameter('fisheye_min_circle_fill_ratio', 0.50)
         self.declare_parameter('fisheye_min_bbox_fill_ratio', 0.45)
 
-        self.declare_parameter('fisheye_entry_center_x_ratio', 0.50)
+        # 鱼眼橙球允许进入撞球子链的横向范围，使用显式 min/max 更直观。
+        self.declare_parameter('fisheye_entry_x_min_ratio', 0.20)
+        self.declare_parameter('fisheye_entry_x_max_ratio', 0.70)
         self.declare_parameter('fisheye_entry_center_y_ratio', 0.50)
-        self.declare_parameter('fisheye_entry_x_tolerance', 0.18)
         self.declare_parameter('fisheye_entry_y_tolerance', 0.25)
-        self.declare_parameter('fisheye_entry_confirm_frames', 3)
+        self.declare_parameter('fisheye_entry_confirm_frames', 1)
 
-        self.declare_parameter('fisheye_approach_vy', 0.20)
-        self.declare_parameter('fisheye_approach_lost_frames', 5)
+        self.declare_parameter('fisheye_approach_vy', 0.12)
+        self.declare_parameter('fisheye_approach_lost_frames', 2)
         self.declare_parameter('fisheye_approach_target_x_ratio', 0.50)
         self.declare_parameter('fisheye_approach_x_deadband_ratio', 0.05)
         self.declare_parameter('fisheye_approach_vx_k', 0.60)
-        self.declare_parameter('fisheye_approach_vx_max', 0.15)
+        self.declare_parameter('fisheye_approach_vx_max', 0.10)
         self.declare_parameter('left_fisheye_x_to_vx_sign', 1.0)
         self.declare_parameter('right_fisheye_x_to_vx_sign', -1.0)
 
         self.declare_parameter('fisheye_hit_radius', 45.0)
-        self.declare_parameter('fisheye_hit_radius_confirm_frames', 3)
-        self.declare_parameter('fisheye_hit_vy', 0.30)
-        self.declare_parameter('fisheye_hit_duration_sec', 0.70)
+        self.declare_parameter('fisheye_hit_radius_confirm_frames', 1)
+        self.declare_parameter('fisheye_hit_vy', 0.20)
+        self.declare_parameter('fisheye_hit_duration_sec', 1.0)
 
         self.declare_parameter('fisheye_recover_forward_vx', 0.0)
-        self.declare_parameter('fisheye_recover_vy', 0.20)
+        self.declare_parameter('fisheye_recover_vy', 0.15)
         self.declare_parameter('fisheye_recover_duration_sec', 2.0)
 
         # =========================
@@ -306,11 +333,10 @@ class Stage2Node(StageNodeBase):
         self.declare_parameter('yellow_min_width_ratio', 0.45)
 
         self.declare_parameter('yellow_stop_line_y_ratio_stage1', 1.0)
-        self.declare_parameter('yellow_stop_line_y_ratio_stage2', 1.0)
+        self.declare_parameter('yellow_stop_line_y_ratio_stage2', 0.75)
         self.declare_parameter('yellow_stop_line_y_ratio_stage3', 1.0)
         self.declare_parameter('yellow_stop_confirm_count', 1)
 
-        self.declare_parameter('yellow_ratio_scan', 0.9)
         self.declare_parameter('yellow_ratio_final', 1.0)
 
         # =========================
@@ -318,15 +344,22 @@ class Stage2Node(StageNodeBase):
         # =========================
         self.declare_parameter('yellow_angle_align_enabled', True)
         # 黄线角度矫正使用固定角速度：只根据 angle_deg 正负决定转向方向。
-        self.declare_parameter('yellow_angle_align_fixed_wz', 0.15)
+        self.declare_parameter('yellow_angle_align_fixed_wz', 0.10)
         self.declare_parameter('yellow_angle_align_deadband_deg', 0.5)
 
         # =========================
         # 巡航 / 中线
         # =========================
-        self.declare_parameter('stage1_cruise_forward_speed', 0.30)
-        self.declare_parameter('stage2_cruise_forward_speed', 0.40)
-        self.declare_parameter('stage3_cruise_ball_only_speed', 0.30)
+        self.declare_parameter('stage1_cruise_forward_speed', 0.20)
+        self.declare_parameter('stage2_cruise_forward_speed', 0.30)
+
+        # 第一次 90° 完成后的 STAGE2_CRUISE_YELLOW_ONLY：
+        # 前 3 秒保持原巡航；3 秒后在无危险小球时加速并小幅向左。
+        self.declare_parameter('stage2_after_turn_left_bias_delay_sec', 3.0)
+        self.declare_parameter('stage2_cruise_forward_speed_after_delay', 0.30)
+        self.declare_parameter('stage2_after_turn_left_bias_vy', 0.02)
+
+        self.declare_parameter('stage3_cruise_ball_only_speed', 0.20)
 
         # =========================
         # 第二赛段左侧近球固定右避让
@@ -335,30 +368,28 @@ class Stage2Node(StageNodeBase):
         # 这里不进入撞球子状态，只在危险球连续出现时给固定右移 vy。
         self.declare_parameter('stage2_left_ball_avoid_enabled', True)
         self.declare_parameter('stage2_left_ball_avoid_center_px', 130)
-        self.declare_parameter('stage2_left_ball_avoid_depth_m', 0.45)
-        self.declare_parameter('stage2_left_ball_avoid_vy', 0.12)
-        self.declare_parameter('stage2_left_ball_avoid_confirm_frames', 2)
-        self.declare_parameter('stage2_left_ball_avoid_min_radius', 8.0)
+        self.declare_parameter('stage2_left_ball_avoid_vy', 0.08)
+        self.declare_parameter('stage2_left_ball_avoid_confirm_frames', 1)
+        # RGB-only 避障判定，不使用 Depth。
+        self.declare_parameter('stage2_left_ball_avoid_min_area', 5000.0)
+        self.declare_parameter('stage2_left_ball_avoid_min_radius', 50.0)
 
-        self.declare_parameter('stage3_go_scan_speed', 0.30)
-        self.declare_parameter('stage3_go_final_speed', 0.40)
+        self.declare_parameter('stage3_go_final_speed', 0.25)
 
         # STAGE3_GO_FINAL 到达最终黄线后，再固定向前走一段。
-        self.declare_parameter('stage3_forward_after_go_final_vx', 0.20)
+        self.declare_parameter('stage3_forward_after_go_final_vx', 0.15)
         self.declare_parameter('stage3_forward_after_go_final_duration_s', 1.0)
 
         # 黄线预触发减速区：先减速，再真正触发切状态
         self.declare_parameter('yellow_slowdown_ratio_stage1', 0.90)
-        self.declare_parameter('yellow_slowdown_ratio_stage2', 0.90)
+        self.declare_parameter('yellow_slowdown_ratio_stage2', 0.7)
         self.declare_parameter('yellow_slowdown_ratio_stage3', 0.90)
-        self.declare_parameter('yellow_slowdown_ratio_scan', 0.80)
         self.declare_parameter('yellow_slowdown_ratio_final', 0.90)
 
-        self.declare_parameter('stage1_yellow_slow_speed', 0.15)
-        self.declare_parameter('stage2_yellow_slow_speed', 0.15)
-        self.declare_parameter('stage3_yellow_slow_speed', 0.15)
-        self.declare_parameter('stage3_go_scan_yellow_slow_speed', 0.15)
-        self.declare_parameter('stage3_go_final_yellow_slow_speed', 0.15)
+        self.declare_parameter('stage1_yellow_slow_speed', 0.10)
+        self.declare_parameter('stage2_yellow_slow_speed', 0.10)
+        self.declare_parameter('stage3_yellow_slow_speed', 0.10)
+        self.declare_parameter('stage3_go_final_yellow_slow_speed', 0.10)
 
         self.declare_parameter('turn_trigger_distance_m', 0.45)
 
@@ -366,19 +397,22 @@ class Stage2Node(StageNodeBase):
         self.declare_parameter('center_cruise_vy_gain', 0.25)  # 保留兼容，当前不再使用
         self.declare_parameter('center_cruise_vy_max', 0.3)  # 保留兼容，当前不再使用
         self.declare_parameter('center_ok_px', 10.0)
-        self.declare_parameter('center_cruise_fixed_vy', 0.10)
+        self.declare_parameter('center_cruise_fixed_vy', 0.06)
         # 左右参考球深度差太大时，不再按两球图像中点做中线对齐，
         # 而是向距离更远的小球一侧给一个较小固定 vy。
-        self.declare_parameter('center_depth_diff_disable_align_m', 0.50)
-        self.declare_parameter('center_far_side_fixed_vy', 0.03)
+        self.declare_parameter('center_depth_diff_disable_align_m', 0.75)
+        self.declare_parameter('center_far_side_fixed_vy', 0.02)
+        # 只看到一侧参考球时，用小速度横移，尝试把另一侧参考球重新带回画面。
+        # 当前方向约定：vy>0 向左，vy<0 向右。
+        self.declare_parameter('center_single_side_fixed_vy', 0.02)
 
         # =========================
         # 对齐球阶段：小 vx + 主 vy
         # =========================
-        self.declare_parameter('lateral_align_forward_speed', 0.125)
-        self.declare_parameter('lateral_align_vy_gain', 0.30)
-        self.declare_parameter('lateral_align_vy_max', 0.30)
-        self.declare_parameter('lateral_align_vy_min', 0.10)
+        self.declare_parameter('lateral_align_forward_speed', 0.08)
+        self.declare_parameter('lateral_align_vy_gain', 0.20)
+        self.declare_parameter('lateral_align_vy_max', 0.18)
+        self.declare_parameter('lateral_align_vy_min', 0.06)
         self.declare_parameter('lateral_align_px_tol', 20.0)
         self.declare_parameter('lateral_align_confirm_count', 1)
 
@@ -405,12 +439,12 @@ class Stage2Node(StageNodeBase):
         # 撞击 / 撞后移动
         # =========================
         # 撞击前冲：按仿真时间结束，不再用 TF 距离和 hit_extra_distance_m。
-        self.declare_parameter('hit_forward_speed', 0.20)
+        self.declare_parameter('hit_forward_speed', 0.15)
         self.declare_parameter('hit_forward_duration_sec', 0.7)
 
         # 撞完后左右移动：固定速度 + 固定仿真时间。
         # 不再使用 post_hit_side_shift_distance_m / fast / slow / slowdown_ratio。
-        self.declare_parameter('post_hit_side_shift_speed', 0.30)
+        self.declare_parameter('post_hit_side_shift_speed', 0.20)
         self.declare_parameter('post_hit_side_shift_duration_sec', 1.5)
 
         # =========================
@@ -420,15 +454,20 @@ class Stage2Node(StageNodeBase):
         self.declare_parameter('ball_retrigger_cooldown_sec', 0.5)
 
         # 先按仿真时间移动一段，再按仿真时间转向一段。
-        self.declare_parameter('stage3_final_left_shift_speed', 0.30)
-        self.declare_parameter('stage3_final_left_shift_duration_sec', 0.6)
-        self.declare_parameter('stage3_final_rotate_wz', 0.30)
-        self.declare_parameter('stage3_final_rotate_duration_sec', 0.8)
+        self.declare_parameter('stage3_final_left_shift_speed', 0.20)
+        self.declare_parameter('stage3_final_left_shift_duration_sec', 1.0)
+        self.declare_parameter('stage3_final_rotate_wz', 0.60)
+        self.declare_parameter('stage3_final_rotate_duration_sec', 1.75)
+
+        # 第三条黄线触发后、180° 掉头前，先固定向左横移一段。
+        # 与最终出口左移参数分开，避免两处互相影响。
+        self.declare_parameter('stage2_before_second_90_left_shift_speed', 0.20)
+        self.declare_parameter('stage2_before_second_90_left_shift_duration_sec', 1.0)
 
         # =========================
         # 第二段左跳后按仿真时间前进
         # =========================
-        self.declare_parameter('stage2_forward_after_left_jump_speed', 0.3)
+        self.declare_parameter('stage2_forward_after_left_jump_speed', 0.20)
         self.declare_parameter('stage2_forward_after_left_jump_duration_sec', 0.3)
 
         # =========================
@@ -436,10 +475,16 @@ class Stage2Node(StageNodeBase):
         # =========================
         # 实际值需要按仿真里机器狗的真实转角微调。
         self.declare_parameter('timed_turn_wz_90', 0.60)
-        self.declare_parameter('timed_turn_duration_90_sec', 3.20)
+
+        # 第一次 90° 左转专用时间。
+        # 第二次 90° 仍继续使用 timed_turn_duration_90_sec = 3.85s。
+        self.declare_parameter('stage1_timed_turn_duration_90_sec', 3.95)
+        self.declare_parameter('timed_turn_duration_90_sec', 3.85)
         self.declare_parameter('timed_turn_wz_180', 0.60)
-        self.declare_parameter('timed_turn_duration_180_sec', 6.4)
+        self.declare_parameter('timed_turn_duration_180_sec', 7.7)
         self.declare_parameter('timed_turn_step_height', 0.02)
+        # 所有固定时间转向开始前，先原地踏步并恢复水平机身姿态。
+        self.declare_parameter('timed_turn_pre_stand_duration_sec', 0.5)
 
         # 第二赛段机身前倾：
         # 默认所有速度动作（巡航、靠近球、侧撞、撞后恢复、平移）均保持前倾；
@@ -450,7 +495,7 @@ class Stage2Node(StageNodeBase):
 
         # 第一次 90° 转向前固定向前走一段。
         # 该动作保持 stage2_body_pitch；进入原转向状态后仍由 send_velocity_command 自动恢复 pitch=0。
-        self.declare_parameter('stage1_before_turn_forward_vx', 0.20)
+        self.declare_parameter('stage1_before_turn_forward_vx', 0.15)
         self.declare_parameter('stage1_before_turn_forward_duration_s', 1.0)
 
         self.p2_entry_table = p2_entry_table()
@@ -493,10 +538,14 @@ class Stage2Node(StageNodeBase):
         self.fisheye_max_aspect_ratio = float(self.get_parameter('fisheye_max_aspect_ratio').value)
         self.fisheye_min_circle_fill_ratio = float(self.get_parameter('fisheye_min_circle_fill_ratio').value)
         self.fisheye_min_bbox_fill_ratio = float(self.get_parameter('fisheye_min_bbox_fill_ratio').value)
-        self.fisheye_entry_center_x_ratio = float(self.get_parameter('fisheye_entry_center_x_ratio').value)
-        self.fisheye_entry_center_y_ratio = float(self.get_parameter('fisheye_entry_center_y_ratio').value)
-        self.fisheye_entry_x_tolerance = float(self.get_parameter('fisheye_entry_x_tolerance').value)
-        self.fisheye_entry_y_tolerance = float(self.get_parameter('fisheye_entry_y_tolerance').value)
+        self.fisheye_entry_x_min_ratio = float(
+            self.get_parameter('fisheye_entry_x_min_ratio').value)
+        self.fisheye_entry_x_max_ratio = float(
+            self.get_parameter('fisheye_entry_x_max_ratio').value)
+        self.fisheye_entry_center_y_ratio = float(
+            self.get_parameter('fisheye_entry_center_y_ratio').value)
+        self.fisheye_entry_y_tolerance = float(
+            self.get_parameter('fisheye_entry_y_tolerance').value)
         self.fisheye_entry_confirm_frames = max(1, int(self.get_parameter('fisheye_entry_confirm_frames').value))
         self.fisheye_approach_vy = abs(float(self.get_parameter('fisheye_approach_vy').value))
         self.fisheye_approach_lost_frames = max(1, int(self.get_parameter('fisheye_approach_lost_frames').value))
@@ -536,7 +585,6 @@ class Stage2Node(StageNodeBase):
         self.yellow_stop_line_y_ratio_stage3 = float(self.get_parameter('yellow_stop_line_y_ratio_stage3').value)
         self.yellow_stop_confirm_count = int(self.get_parameter('yellow_stop_confirm_count').value)
 
-        self.yellow_ratio_scan = float(self.get_parameter('yellow_ratio_scan').value)
         self.yellow_ratio_final = float(self.get_parameter('yellow_ratio_final').value)
 
         self.yellow_angle_align_enabled = bool(self.get_parameter('yellow_angle_align_enabled').value)
@@ -545,15 +593,28 @@ class Stage2Node(StageNodeBase):
 
         self.stage1_cruise_forward_speed = float(self.get_parameter('stage1_cruise_forward_speed').value)
         self.stage2_cruise_forward_speed = float(self.get_parameter('stage2_cruise_forward_speed').value)
+
+        self.stage2_after_turn_left_bias_delay_sec = max(
+            0.0,
+            float(self.get_parameter('stage2_after_turn_left_bias_delay_sec').value)
+        )
+        self.stage2_cruise_forward_speed_after_delay = float(
+            self.get_parameter('stage2_cruise_forward_speed_after_delay').value
+        )
+        self.stage2_after_turn_left_bias_vy = abs(float(
+            self.get_parameter('stage2_after_turn_left_bias_vy').value
+        ))
+
         self.stage3_cruise_ball_only_speed = float(self.get_parameter('stage3_cruise_ball_only_speed').value)
 
         self.stage2_left_ball_avoid_enabled = bool(self.get_parameter('stage2_left_ball_avoid_enabled').value)
         self.stage2_left_ball_avoid_center_px = float(self.get_parameter('stage2_left_ball_avoid_center_px').value)
-        self.stage2_left_ball_avoid_depth_m = float(self.get_parameter('stage2_left_ball_avoid_depth_m').value)
         self.stage2_left_ball_avoid_vy = abs(float(self.get_parameter('stage2_left_ball_avoid_vy').value))
         self.stage2_left_ball_avoid_confirm_frames = int(self.get_parameter('stage2_left_ball_avoid_confirm_frames').value)
-        self.stage2_left_ball_avoid_min_radius = float(self.get_parameter('stage2_left_ball_avoid_min_radius').value)
-        self.stage3_go_scan_speed = float(self.get_parameter('stage3_go_scan_speed').value)
+        self.stage2_left_ball_avoid_min_area = float(
+            self.get_parameter('stage2_left_ball_avoid_min_area').value)
+        self.stage2_left_ball_avoid_min_radius = float(
+            self.get_parameter('stage2_left_ball_avoid_min_radius').value)
         self.stage3_go_final_speed = float(self.get_parameter('stage3_go_final_speed').value)
         self.stage3_forward_after_go_final_vx = float(
             self.get_parameter('stage3_forward_after_go_final_vx').value
@@ -566,13 +627,11 @@ class Stage2Node(StageNodeBase):
         self.yellow_slowdown_ratio_stage1 = float(self.get_parameter('yellow_slowdown_ratio_stage1').value)
         self.yellow_slowdown_ratio_stage2 = float(self.get_parameter('yellow_slowdown_ratio_stage2').value)
         self.yellow_slowdown_ratio_stage3 = float(self.get_parameter('yellow_slowdown_ratio_stage3').value)
-        self.yellow_slowdown_ratio_scan = float(self.get_parameter('yellow_slowdown_ratio_scan').value)
         self.yellow_slowdown_ratio_final = float(self.get_parameter('yellow_slowdown_ratio_final').value)
 
         self.stage1_yellow_slow_speed = float(self.get_parameter('stage1_yellow_slow_speed').value)
         self.stage2_yellow_slow_speed = float(self.get_parameter('stage2_yellow_slow_speed').value)
         self.stage3_yellow_slow_speed = float(self.get_parameter('stage3_yellow_slow_speed').value)
-        self.stage3_go_scan_yellow_slow_speed = float(self.get_parameter('stage3_go_scan_yellow_slow_speed').value)
         self.stage3_go_final_yellow_slow_speed = float(self.get_parameter('stage3_go_final_yellow_slow_speed').value)
 
         self.turn_trigger_distance_m = float(self.get_parameter('turn_trigger_distance_m').value)
@@ -585,6 +644,8 @@ class Stage2Node(StageNodeBase):
             self.get_parameter('center_depth_diff_disable_align_m').value
         )
         self.center_far_side_fixed_vy = abs(float(self.get_parameter('center_far_side_fixed_vy').value))
+        self.center_single_side_fixed_vy = abs(float(
+            self.get_parameter('center_single_side_fixed_vy').value))
 
         self.lateral_align_forward_speed = float(self.get_parameter('lateral_align_forward_speed').value)
         self.lateral_align_vy_gain = float(self.get_parameter('lateral_align_vy_gain').value)
@@ -618,6 +679,13 @@ class Stage2Node(StageNodeBase):
         self.stage3_final_rotate_duration_sec = float(
             self.get_parameter('stage3_final_rotate_duration_sec').value
         )
+        self.stage2_before_second_90_left_shift_speed = abs(float(
+            self.get_parameter('stage2_before_second_90_left_shift_speed').value
+        ))
+        self.stage2_before_second_90_left_shift_duration_sec = max(
+            0.0,
+            float(self.get_parameter('stage2_before_second_90_left_shift_duration_sec').value)
+        )
 
         self.stage2_forward_after_left_jump_speed = float(
             self.get_parameter('stage2_forward_after_left_jump_speed').value)
@@ -625,10 +693,22 @@ class Stage2Node(StageNodeBase):
             self.get_parameter('stage2_forward_after_left_jump_duration_sec').value)
 
         self.timed_turn_wz_90 = float(self.get_parameter('timed_turn_wz_90').value)
-        self.timed_turn_duration_90_sec = float(self.get_parameter('timed_turn_duration_90_sec').value)
+
+        self.stage1_timed_turn_duration_90_sec = float(
+            self.get_parameter('stage1_timed_turn_duration_90_sec').value
+        )
+
+        # 第二次 90° 继续使用原来的 3.85s。
+        self.timed_turn_duration_90_sec = float(
+            self.get_parameter('timed_turn_duration_90_sec').value
+        )
         self.timed_turn_wz_180 = float(self.get_parameter('timed_turn_wz_180').value)
         self.timed_turn_duration_180_sec = float(self.get_parameter('timed_turn_duration_180_sec').value)
         self.timed_turn_step_height = float(self.get_parameter('timed_turn_step_height').value)
+        self.timed_turn_pre_stand_duration_sec = max(
+            0.0,
+            float(self.get_parameter('timed_turn_pre_stand_duration_sec').value)
+        )
 
         self.stage2_body_pitch = float(
             self.get_parameter('stage2_body_pitch').value
@@ -643,12 +723,33 @@ class Stage2Node(StageNodeBase):
             0.0,
             float(self.get_parameter('stage1_before_turn_forward_duration_s').value)
         )
-        # 这些状态属于定时原地转向，发送速度命令时恢复 pitch=0。
+        # 这些状态属于固定时间原地转向：
+        # - 控制循环使用 30 Hz；
+        # - RGB / Depth / 双鱼眼视觉处理全部暂停；
+        # - 发送速度命令时恢复 pitch=0。
+        # 这些“固定时间动作”使用 30 Hz，并暂停全部视觉处理。
+        # STAGE2_LEFT_SHIFT_BEFORE_SECOND_90 虽然不是转向，也放在这里，
+        # 这样第二次90°前的固定横移计时更精确，同时减轻视觉算力。
+        self.stage2_timed_turn_states = {
+            'STAGE1_ROTATE_LEFT_90',
+            'STAGE2_ROTATE_LEFT_90',
+            'STAGE2_LEFT_SHIFT_BEFORE_SECOND_90',
+            'STAGE3_ROTATE_BACK_180',
+            'STAGE3_FINAL_ROTATE_AFTER_LEFT_SHIFT',
+        }
+        # 只有真正的原地转向/转向前踏步阶段恢复水平机身。
+        # 第二次90°前的左移仍保持第二赛段正常前倾姿态。
         self.stage2_level_body_states = {
             'STAGE1_ROTATE_LEFT_90',
             'STAGE2_ROTATE_LEFT_90',
             'STAGE3_ROTATE_BACK_180',
             'STAGE3_FINAL_ROTATE_AFTER_LEFT_SHIFT',
+        }
+        self.stage2_rgb_required_states = {
+            'STAGE1_CRUISE_BALL_AND_YELLOW',
+            'STAGE2_CRUISE_YELLOW_ONLY',
+            'STAGE3_PRE180_CENTER_YELLOW',
+            'STAGE3_GO_FINAL',
         }
 
         self.rgb_w = 640
@@ -667,6 +768,9 @@ class Stage2Node(StageNodeBase):
 
             'orange_balls': [],
             'blue_balls': [],
+            # STAGE2_CRUISE_YELLOW_ONLY 专用 RGB-only 避让候选；
+            # 不要求 depth 有效，因此不会受深度抖动影响。
+            'stage2_avoid_rgb_balls': [],
             'left_balls': [],
             'right_balls': [],
             'has_center_reference': False,
@@ -717,11 +821,20 @@ class Stage2Node(StageNodeBase):
         self.last_ball_done_time_sec: Optional[float] = None
         self.last_ball_done_pose: Optional[Tuple[float, float, float]] = None
 
+        # 第一次 90° 后巡航的计时起点。
+        self.stage2_cruise_after_first_turn_start_time_sec: Optional[float] = None
+
+        # 只要 STAGE2_CRUISE_YELLOW_ONLY 中曾经真正触发过一次危险小球避障，
+        # 就锁存为 True。之后即使小球消失，也不再给主动左移偏置。
+        self.stage2_danger_ball_seen_once = False
+
         self.stage2_forward_after_left_jump_start_time_sec: Optional[float] = None
+        self.stage2_before_second_90_left_shift_start_time_sec: Optional[float] = None
         self.stage3_final_left_shift_start_time_sec: Optional[float] = None
         self.stage3_final_rotate_start_time_sec: Optional[float] = None
         self.stage3_forward_after_go_final_start_time_sec: Optional[float] = None
         self.timed_turn_start_time_sec: Optional[float] = None
+        self.timed_turn_pre_stand_start_time_sec: Optional[float] = None
         self.before_turn_forward_start_time_sec: Optional[float] = None
 
         self.lateral_align_counter = 0
@@ -740,7 +853,6 @@ class Stage2Node(StageNodeBase):
         self.last_hit_side: Optional[str] = None
         self.side_shift_done: bool = False
 
-        self.orange_hit_count = 0
 
         # 第一、第三巡航阶段分别记录已经成功撞过橙球的鱼眼侧。
         # 同一阶段内每侧最多只有一个橙球；撞完后不再处理该侧，
@@ -759,7 +871,15 @@ class Stage2Node(StageNodeBase):
             'vy': 0.0,
         }
 
-        # 双鱼眼缓存。巡航居中仍使用原 RGB + Depth 逻辑。
+        # 视觉消息只缓存最新一帧；真正的 cv_bridge + OpenCV 检测统一在
+        # 5 Hz 控制拍开始时执行。这样不会让 RGB/Depth/鱼眼回调把单线程
+        # executor 挤满，也不会排队处理旧图像。定时转向状态仍完全不处理视觉。
+        self._pending_rgb_msg: Optional[Image] = None
+        self._pending_depth_msg: Optional[Image] = None
+        self._pending_fisheye_left_msg: Optional[Image] = None
+        self._pending_fisheye_right_msg: Optional[Image] = None
+
+        # 双鱼眼检测结果缓存。巡航居中仍使用原 RGB + Depth 逻辑。
         self.latest_fisheye_left_target: Optional[Dict] = None
         self.latest_fisheye_right_target: Optional[Dict] = None
         self.fisheye_left_entry_counter = 0
@@ -782,6 +902,11 @@ class Stage2Node(StageNodeBase):
         self.get_logger().info(
             f'Stage2Node ready. fisheye_left={self.fisheye_left_topic}, '
             f'fisheye_right={self.fisheye_right_topic}'
+        )
+        self.get_logger().info(
+            f'[P2_RATE] normal={self.stage2_control_hz:.1f} Hz, '
+            f'timed_turn={self.stage2_timed_turn_control_hz:.1f} Hz, '
+            f'timed_turn_vision=OFF'
         )
 
     def send_velocity_command(
@@ -897,6 +1022,9 @@ class Stage2Node(StageNodeBase):
         return entry
 
     def on_activated(self):
+        # 每次激活都让普通 5 Hz 控制立即执行第一拍。
+        self._stage2_next_low_rate_tick_monotonic = None
+
         # Full mission startup already performs the single RecoveryStand(111).
         # Do not inject another preset action merely because Stage2 becomes active.
 
@@ -919,10 +1047,12 @@ class Stage2Node(StageNodeBase):
         self.ball_return_state = self.p2_ball_return_state
 
         self.stage2_forward_after_left_jump_start_time_sec = None
+        self.stage2_before_second_90_left_shift_start_time_sec = None
         self.stage3_final_left_shift_start_time_sec = None
         self.stage3_final_rotate_start_time_sec = None
         self.stage3_forward_after_go_final_start_time_sec = None
         self.timed_turn_start_time_sec = None
+        self.timed_turn_pre_stand_start_time_sec = None
         self.before_turn_forward_start_time_sec = None
 
         self.last_ball_done_time_sec = None
@@ -948,15 +1078,139 @@ class Stage2Node(StageNodeBase):
         )
         self.send_velocity_command(initial_vx, 0.0, 0.0)
 
-        # 激活前只缓存了原始图像消息；先转换一帧，让第一个 control tick 就有视觉结果。
-        if self.latest_bgr is None and self.latest_rgb_msg is not None:
-            try:
-                self.latest_bgr = self.bridge.imgmsg_to_cv2(self.latest_rgb_msg, desired_encoding='bgr8')
-            except Exception:
-                self.latest_bgr = None
-        if self.latest_bgr is not None:
-            self.latest_ball_result = self.detect_ball_scene(self.latest_bgr)
-            self.latest_yellow_result = self.detect_yellow_stop_line(self.latest_bgr)
+        # 激活前公共节点已经缓存了最新原始 RGB/Depth 消息。这里只把它们作为
+        # 第一拍的 pending 输入，真正的转换/检测仍统一放到 5 Hz 控制拍里。
+        self._pending_rgb_msg = None
+        self._pending_depth_msg = None
+        self._pending_fisheye_left_msg = None
+        self._pending_fisheye_right_msg = None
+        if not self.is_stage2_timed_turn_state():
+            if self.latest_rgb_msg is not None:
+                self._pending_rgb_msg = self.latest_rgb_msg
+            if self.latest_depth_msg is not None:
+                self._pending_depth_msg = self.latest_depth_msg
+
+    def is_stage2_timed_turn_state(self, state: Optional[str] = None) -> bool:
+        """固定时间高精度动作使用 30 Hz，并暂停全部视觉处理。"""
+        target_state = self.state if state is None else state
+        return target_state in self.stage2_timed_turn_states
+
+    def stage2_control_tick_due(self) -> bool:
+        """30 Hz 底层定时器之上实现：普通状态 5 Hz，固定时间动作状态 30 Hz。"""
+        if self.is_stage2_timed_turn_state():
+            return True
+
+        now = time.monotonic()
+        if self._stage2_next_low_rate_tick_monotonic is None:
+            self._stage2_next_low_rate_tick_monotonic = now + self.stage2_control_period_s
+            return True
+
+        if now < self._stage2_next_low_rate_tick_monotonic:
+            return False
+
+        # 用固定周期向前推进 deadline，避免直接用 now 重置造成长期频率漂移。
+        while self._stage2_next_low_rate_tick_monotonic <= now:
+            self._stage2_next_low_rate_tick_monotonic += self.stage2_control_period_s
+        return True
+
+    def handle_rgb_msg(self, msg: Image):
+        """RGB 回调只覆盖保存最新消息；5 Hz 控制拍再转换和检测。"""
+        if self.is_stage2_timed_turn_state():
+            self._pending_rgb_msg = None
+            return
+        self._pending_rgb_msg = msg
+
+    def depth_callback(self, msg: Image):
+        """Depth 回调只覆盖保存最新消息；避免全帧率做 cv_bridge 转换。"""
+        self.latest_depth_msg = msg
+        if not self.active or self.finished or self.is_stage2_timed_turn_state():
+            self._pending_depth_msg = None
+            return
+        self._pending_depth_msg = msg
+
+    def process_stage2_latest_vision(self):
+        """每个普通 5 Hz 控制拍只消费各相机最新一帧。
+
+        顺序先 Depth、后 RGB，保证 RGB 球检测读取到尽可能新的深度；
+        两路鱼眼也各最多处理一帧。中间到来的旧消息会被直接覆盖。
+        """
+        if self.is_stage2_timed_turn_state():
+            self._pending_rgb_msg = None
+            self._pending_depth_msg = None
+            self._pending_fisheye_left_msg = None
+            self._pending_fisheye_right_msg = None
+            return
+
+        ball_subchain_active = self.state in P2_BALL_SUBCHAIN_STATES
+
+        # 撞球/回退期间 RGB+Depth 不做转换和识别。
+        # 黄线必须等 BALL_POST_HIT_SIDE_SHIFT 完成并返回巡航后再处理。
+        if ball_subchain_active:
+            rgb_processed = False
+            self.get_logger().info(
+                f'[P2_VISION] state={self.state}: defer RGB/Depth until ball recovery completes',
+                throttle_duration_sec=1.0
+            )
+        else:
+            depth_msg = self._pending_depth_msg
+            self._pending_depth_msg = None
+            if depth_msg is not None:
+                StageNodeBase.depth_callback(self, depth_msg)
+
+            rgb_msg = self._pending_rgb_msg
+            self._pending_rgb_msg = None
+            rgb_processed = rgb_msg is not None
+            if rgb_processed:
+                StageNodeBase.handle_rgb_msg(self, rgb_msg)
+
+            rgb_age = self.rgb_age_s()
+            self.get_logger().info(
+                f'[P2_VISION] rgb_new={rgb_processed} rgb_seq={self.latest_rgb_seq} '
+                f'rgb_age={rgb_age if rgb_age is not None else -1.0:.3f}s '
+                f'yellow={self.latest_yellow_result.get("has_line", False)}',
+                throttle_duration_sec=1.0
+            )
+
+        fisheye_detection_enabled = (
+            ball_subchain_active
+            or self.state in (
+                'STAGE1_CRUISE_BALL_AND_YELLOW',
+                'STAGE3_GO_FINAL',
+            )
+        )
+
+        if not fisheye_detection_enabled:
+            # 第二次90°后到180°之前不做鱼眼图像转换/橙球检测，节省算力。
+            self._pending_fisheye_left_msg = None
+            self._pending_fisheye_right_msg = None
+            self.latest_fisheye_left_target = None
+            self.latest_fisheye_right_target = None
+            self.fisheye_left_entry_counter = 0
+            self.fisheye_right_entry_counter = 0
+        else:
+            left_msg = self._pending_fisheye_left_msg
+            self._pending_fisheye_left_msg = None
+            if left_msg is not None:
+                if self.is_fisheye_side_ignored('left'):
+                    self.latest_fisheye_left_target = None
+                else:
+                    try:
+                        frame = self.bridge.imgmsg_to_cv2(left_msg, desired_encoding='bgr8')
+                        self.latest_fisheye_left_target = self.detect_fisheye_orange_ball(frame)
+                    except Exception as exc:
+                        self.get_logger().error(f'left fisheye processing failed: {exc}')
+
+            right_msg = self._pending_fisheye_right_msg
+            self._pending_fisheye_right_msg = None
+            if right_msg is not None:
+                if self.is_fisheye_side_ignored('right'):
+                    self.latest_fisheye_right_target = None
+                else:
+                    try:
+                        frame = self.bridge.imgmsg_to_cv2(right_msg, desired_encoding='bgr8')
+                        self.latest_fisheye_right_target = self.detect_fisheye_orange_ball(frame)
+                    except Exception as exc:
+                        self.get_logger().error(f'right fisheye processing failed: {exc}')
 
     def on_rgb_frame(self, frame: np.ndarray):
         self.latest_ball_result = self.detect_ball_scene(frame)
@@ -1038,24 +1292,22 @@ class Stage2Node(StageNodeBase):
         )
 
     def fisheye_left_callback(self, msg: Image):
-        if self.is_fisheye_side_ignored('left'):
+        if self.is_stage2_timed_turn_state():
+            self._pending_fisheye_left_msg = None
             self.latest_fisheye_left_target = None
+            self.fisheye_left_entry_counter = 0
             return
-        try:
-            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            self.latest_fisheye_left_target = self.detect_fisheye_orange_ball(frame)
-        except Exception as exc:
-            self.get_logger().error(f'left fisheye callback failed: {exc}')
+        # 只保留最新消息，不在相机 callback 里做 OpenCV。
+        self._pending_fisheye_left_msg = msg
 
     def fisheye_right_callback(self, msg: Image):
-        if self.is_fisheye_side_ignored('right'):
+        if self.is_stage2_timed_turn_state():
+            self._pending_fisheye_right_msg = None
             self.latest_fisheye_right_target = None
+            self.fisheye_right_entry_counter = 0
             return
-        try:
-            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            self.latest_fisheye_right_target = self.detect_fisheye_orange_ball(frame)
-        except Exception as exc:
-            self.get_logger().error(f'right fisheye callback failed: {exc}')
+        # 只保留最新消息，不在相机 callback 里做 OpenCV。
+        self._pending_fisheye_right_msg = msg
 
     def detect_fisheye_orange_ball(self, frame: np.ndarray) -> Optional[Dict]:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -1104,9 +1356,11 @@ class Stage2Node(StageNodeBase):
             return False
         h, w = target['image_shape']
         cx, cy = target['center']
+        x_ratio = cx / float(max(w, 1))
+        y_ratio = cy / float(max(h, 1))
         return (
-            abs(cx / float(max(w, 1)) - self.fisheye_entry_center_x_ratio) <= self.fisheye_entry_x_tolerance
-            and abs(cy / float(max(h, 1)) - self.fisheye_entry_center_y_ratio) <= self.fisheye_entry_y_tolerance
+            self.fisheye_entry_x_min_ratio <= x_ratio <= self.fisheye_entry_x_max_ratio
+            and abs(y_ratio - self.fisheye_entry_center_y_ratio) <= self.fisheye_entry_y_tolerance
         )
 
     def update_fisheye_entry_counters(self):
@@ -1236,6 +1490,86 @@ class Stage2Node(StageNodeBase):
     # ============================================================
     # 球检测
     # ============================================================
+    def detect_stage2_avoid_rgb_candidates(self, frame: np.ndarray) -> List[Dict]:
+        """
+        STAGE2_CRUISE_YELLOW_ONLY 专用 RGB-only 小球候选。
+
+        这一份检测故意不读取 Depth。它只复用当前蓝球/橙球 HSV、形态学和
+        min_contour_area 参数，用于第一次 90° 后的左侧小球规避。
+
+        真正避让条件仍在 choose_stage2_left_danger_ball() 中判断：
+          1) 球中心在图像中心左侧；
+          2) image_center_x - cx <= stage2_left_ball_avoid_center_px；
+          3) area >= stage2_left_ball_avoid_min_area；
+          4) radius >= stage2_left_ball_avoid_min_radius。
+        """
+        h, w = frame.shape[:2]
+        image_center_x = w // 2
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        kernel = np.ones((5, 5), np.uint8)
+
+        configs = (
+            (
+                'orange',
+                self.orange_h_min, self.orange_h_max,
+                self.orange_s_min, self.orange_s_max,
+                self.orange_v_min, self.orange_v_max,
+                self.orange_min_contour_area,
+            ),
+            (
+                'blue',
+                self.blue_h_min, self.blue_h_max,
+                self.blue_s_min, self.blue_s_max,
+                self.blue_v_min, self.blue_v_max,
+                self.blue_min_contour_area,
+            ),
+        )
+
+        candidates: List[Dict] = []
+
+        for (
+                color_name,
+                h_min, h_max,
+                s_min, s_max,
+                v_min, v_max,
+                min_contour_area,
+        ) in configs:
+            lower = np.array([h_min, s_min, v_min], dtype=np.uint8)
+            upper = np.array([h_max, s_max, v_max], dtype=np.uint8)
+            mask = cv2.inRange(hsv, lower, upper)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+            contours = find_contours(mask)
+
+            for cnt in contours:
+                area = float(cv2.contourArea(cnt))
+                if area < float(min_contour_area):
+                    continue
+
+                (cx_f, cy_f), r_circle = cv2.minEnclosingCircle(cnt)
+                cx = int(cx_f)
+                cy = int(cy_f)
+                r_circle = float(r_circle)
+                r_eq = math.sqrt(area / math.pi)
+                radius = min(r_circle, r_eq)
+
+                candidates.append({
+                    'color': color_name,
+                    'center': (cx, cy),
+                    'radius': float(radius),
+                    'radius_circle': r_circle,
+                    'radius_eq': r_eq,
+                    'area': area,
+                    # 明确标记：这一份候选没有使用深度。
+                    'depth_m': None,
+                    'error_x': int(cx - image_center_x),
+                    'side': 'left' if cx < image_center_x else 'right',
+                    'rgb_only': True,
+                })
+
+        return candidates
+
     def detect_color_ball_candidates(
             self,
             frame: np.ndarray,
@@ -1339,6 +1673,10 @@ class Stage2Node(StageNodeBase):
             'blue'
         )
 
+        # 第一次 90° 后避让使用独立 RGB-only 候选。
+        # 即使 Depth 没值，这里依然能够识别并触发横移。
+        stage2_avoid_rgb_balls = self.detect_stage2_avoid_rgb_candidates(frame)
+
         all_balls = orange_balls + blue_balls
         image_center_x = w // 2
 
@@ -1372,6 +1710,7 @@ class Stage2Node(StageNodeBase):
 
                 'orange_balls': orange_balls,
                 'blue_balls': blue_balls,
+                'stage2_avoid_rgb_balls': stage2_avoid_rgb_balls,
                 'left_balls': left_balls,
                 'right_balls': right_balls,
                 'has_center_reference': has_center_reference,
@@ -1394,6 +1733,7 @@ class Stage2Node(StageNodeBase):
 
             'orange_balls': orange_balls,
             'blue_balls': blue_balls,
+            'stage2_avoid_rgb_balls': stage2_avoid_rgb_balls,
             'left_balls': left_balls,
             'right_balls': right_balls,
             'has_center_reference': has_center_reference,
@@ -1485,12 +1825,11 @@ class Stage2Node(StageNodeBase):
         best_contour = None
         best_score = -1.0
 
-        # STAGE1_CRUISE_BALL_AND_YELLOW 和 STAGE3_CRUISE_BALL_ONLY
-        # 这两个状态不要求黄线候选必须是“前方横线”。
+        # 第一赛道和最终黄线阶段放宽黄线形状约束。
+        # 第二次90°后的 PRE180 阶段保持和 STAGE2_CRUISE_YELLOW_ONLY 一样，
+        # 要求候选是前方横线。
         require_front_horizontal = self.state not in (
             'STAGE1_CRUISE_BALL_AND_YELLOW',
-            'STAGE3_CRUISE_BALL_ONLY',
-            'STAGE3_GO_SCAN',
             'STAGE3_GO_FINAL',
         )
 
@@ -1556,20 +1895,37 @@ class Stage2Node(StageNodeBase):
             if new_state in (
                     'STAGE1_CRUISE_BALL_AND_YELLOW',
                     'STAGE2_CRUISE_YELLOW_ONLY',
-                    'STAGE3_CRUISE_BALL_ONLY',
-                    'STAGE3_GO_SCAN',
+                    'STAGE3_PRE180_CENTER_YELLOW',
                     'STAGE3_GO_FINAL'
             ):
                 self.yellow_stop_counter = 0
+
+            if new_state == 'STAGE2_CRUISE_YELLOW_ONLY':
+                self.stage2_cruise_after_first_turn_start_time_sec = None
+                self.stage2_left_ball_avoid_counter = 0
+                self.stage2_left_ball_avoid_active = False
+                self.stage2_danger_ball_seen_once = False
 
             if new_state == 'STAGE1_CRUISE_BALL_AND_YELLOW':
                 self.stage1_yellow_touched_bottom = False
                 self.stage1_yellow_disappear_counter = 0
 
+            if new_state == 'STAGE3_PRE180_CENTER_YELLOW':
+                # 第二次90°后明确关闭鱼眼撞球入口，并清除之前的鱼眼目标缓存。
+                self.latest_fisheye_left_target = None
+                self.latest_fisheye_right_target = None
+                self.fisheye_left_entry_counter = 0
+                self.fisheye_right_entry_counter = 0
+                self._pending_fisheye_left_msg = None
+                self._pending_fisheye_right_msg = None
+
             if new_state in (
                     'STAGE1_FORWARD_BEFORE_ROTATE',
             ):
                 self.before_turn_forward_start_time_sec = None
+
+            if new_state == 'STAGE2_LEFT_SHIFT_BEFORE_SECOND_90':
+                self.stage2_before_second_90_left_shift_start_time_sec = None
 
             if new_state in (
                     'STAGE1_ROTATE_LEFT_90',
@@ -1577,6 +1933,7 @@ class Stage2Node(StageNodeBase):
                     'STAGE3_ROTATE_BACK_180',
             ):
                 self.timed_turn_start_time_sec = None
+                self.timed_turn_pre_stand_start_time_sec = None
 
             if new_state == 'STAGE3_ROTATE_LEFT_30':
                 self.stage3_final_left_shift_start_time_sec = None
@@ -1586,6 +1943,7 @@ class Stage2Node(StageNodeBase):
 
             if new_state == 'STAGE3_FINAL_ROTATE_AFTER_LEFT_SHIFT':
                 self.stage3_final_rotate_start_time_sec = None
+                self.timed_turn_pre_stand_start_time_sec = None
 
             if new_state == 'STAGE2_MOVE_FORWARD_AFTER_LEFT_JUMP_TIME':
                 self.stage2_forward_after_left_jump_start_time_sec = None
@@ -1711,6 +2069,74 @@ class Stage2Node(StageNodeBase):
         return False
 
     # ============================================================
+    # 固定时间转向：转向前先原地踏步恢复姿态
+    # ============================================================
+    def execute_timed_turn(self, wz: float, duration_sec: float, next_state: str) -> bool:
+        """
+        第二赛段定时转向专用版本。
+
+        当前状态一进入定时转向：
+        1) 先以 30 Hz 发送 vx=vy=wz=0，持续 timed_turn_pre_stand_duration_sec；
+           由于当前状态属于 stage2_level_body_states，send_velocity_command 会自动使用
+           pitch=0 和 timed_turn_step_height，让机器狗原地踏步恢复水平机身姿态。
+        2) 预恢复完成后才开始计算真正的转向 duration_sec。
+        3) 整个预恢复 + 转向期间都属于 timed-turn state，因此 RGB/Depth/鱼眼视觉均关闭。
+        """
+        now = self.now_sec()
+
+        # A. 转向前原地踏步恢复姿态
+        if self.timed_turn_pre_stand_start_time_sec is None:
+            self.timed_turn_pre_stand_start_time_sec = now
+            self.get_logger().info(
+                f'[PRE_TURN_STAND] start: duration='
+                f'{self.timed_turn_pre_stand_duration_sec:.2f}s, next_turn_wz={wz:.3f}'
+            )
+
+        self.timed_turn_pre_stand_start_time_sec = self.align_motion_timer_start(
+            self.timed_turn_pre_stand_start_time_sec, now)
+        prep_elapsed = max(
+            0.0, now - self.timed_turn_pre_stand_start_time_sec)
+
+        if prep_elapsed < self.timed_turn_pre_stand_duration_sec:
+            self.send_velocity_command(
+                0.0, 0.0, 0.0,
+                step_height=self.timed_turn_step_height
+            )
+            return True
+
+        # B. 0.5s 恢复完成后，再开始真正的定时转向。
+        if self.timed_turn_start_time_sec is None:
+            self.timed_turn_start_time_sec = now
+            self.get_logger().info(
+                f'[PRE_TURN_STAND] done: elapsed={prep_elapsed:.2f}s'
+            )
+            self.get_logger().info(
+                f'[TIMED_TURN] start: wz={wz:.3f}, '
+                f'duration={duration_sec:.2f}s, next={next_state}'
+            )
+
+        self.timed_turn_start_time_sec = self.align_motion_timer_start(
+            self.timed_turn_start_time_sec, now)
+        elapsed = max(0.0, now - self.timed_turn_start_time_sec)
+
+        if elapsed >= duration_sec:
+            self.get_logger().info(
+                f'[TIMED_TURN] done: elapsed={elapsed:.2f}s, next={next_state}'
+            )
+            self.timed_turn_start_time_sec = None
+            self.timed_turn_pre_stand_start_time_sec = None
+            self.set_state(next_state)
+            return True
+
+        self.send_velocity_command(
+            0.0,
+            0.0,
+            wz,
+            step_height=self.timed_turn_step_height
+        )
+        return True
+
+    # ============================================================
     # 巡航中线
     # ============================================================
     def send_center_cruise_command(self, ball: Dict, vx: float):
@@ -1718,19 +2144,23 @@ class Stage2Node(StageNodeBase):
 
     def compute_center_cruise_vy(self, ball: Dict) -> float:
         """
-        中线对齐固定 vy 横向平移版本，加入“左右深度差保护”。
+        RGB 中线横移修正。
 
-        1. 如果左右参考球都有，并且两个球深度差太大：
-           不再使用两球图像中点 center_error_px 对齐，
-           而是向距离更远的小球那一侧给一个较小固定 vy。
+        1. 只看到左侧参考球：
+           认为右侧参考球可能已经跑出画面，向右小幅横移（vy < 0），
+           直到重新同时看到左右两侧参考球。
 
-           left_depth > right_depth：左球更远 -> 向左小幅横移 -> vy > 0
-           right_depth > left_depth：右球更远 -> 向右小幅横移 -> vy < 0
+        2. 只看到右侧参考球：
+           认为左侧参考球可能已经跑出画面，向左小幅横移（vy > 0），
+           直到重新同时看到左右两侧参考球。
 
-        2. 如果左右参考球深度差不大：
-           使用原来的图像中点对齐逻辑，超过 center_ok_px 后给固定 center_cruise_fixed_vy。
+        3. 左右参考球都有，但深度差过大：
+           暂停使用图像中点，向距离更远的一侧给小幅 far-side bias。
 
-        如果实测方向反了，只需要对调对应分支里的正负号。
+        4. 左右参考球都有且深度差不大：
+           使用 center_error_px 做正常固定 vy 中点矫正。
+
+        如果真机横移方向与注释相反，只需要对调单侧分支的正负号。
         """
         self.center_cruise_debug_info = {
             'mode': 'NO_CENTER_REF',
@@ -1741,15 +2171,46 @@ class Stage2Node(StageNodeBase):
             'vy': 0.0,
         }
 
-        if not ball.get('has_center_reference', False):
-            return 0.0
-
         left_ref = ball.get('left_ref')
         right_ref = ball.get('right_ref')
         err_px = ball.get('center_error_px', None)
 
-        if left_ref is None or right_ref is None:
+        # 单侧参考球恢复：
+        # 只见左球 -> 向右找回右球 -> vy < 0
+        # 只见右球 -> 向左找回左球 -> vy > 0
+        if left_ref is not None and right_ref is None:
+            vy = -abs(self.center_single_side_fixed_vy)
+            self.center_cruise_debug_info.update({
+                'mode': 'SINGLE_LEFT_RECOVER_RIGHT',
+                'left_depth': left_ref.get('depth_m', None),
+                'vy': vy,
+            })
+            self.get_logger().info(
+                f'center single-side recover: only_left=Y, only_right=N, '
+                f'move=right, vy={vy:.3f}',
+                throttle_duration_sec=0.3
+            )
+            return vy
+
+        if left_ref is None and right_ref is not None:
+            vy = abs(self.center_single_side_fixed_vy)
+            self.center_cruise_debug_info.update({
+                'mode': 'SINGLE_RIGHT_RECOVER_LEFT',
+                'right_depth': right_ref.get('depth_m', None),
+                'vy': vy,
+            })
+            self.get_logger().info(
+                f'center single-side recover: only_left=N, only_right=Y, '
+                f'move=left, vy={vy:.3f}',
+                throttle_duration_sec=0.3
+            )
+            return vy
+
+        # 两侧都没有参考球，无法判断横移方向。
+        if left_ref is None and right_ref is None:
             return 0.0
+
+        # 到这里说明左右球都重新出现，自动恢复原有双球居中逻辑。
 
         left_depth = left_ref.get('depth_m', None)
         right_depth = right_ref.get('depth_m', None)
@@ -1839,29 +2300,33 @@ class Stage2Node(StageNodeBase):
 
     def choose_stage2_left_danger_ball(self, ball: Dict) -> Optional[Dict]:
         """
-        第二赛段左侧近球避让目标选择。
+        第二赛段第一次 90° 后的左侧小球避让目标选择（RGB-only）。
 
-        只使用已经由 detect_ball_scene() 检出的蓝球和橙球，不单独新增视觉检测。
+        不再使用任何深度条件。
+
         触发条件：
-        1. 球在图像中心左侧；
-        2. 球距离图像中心不能太远：image_center_x - cx <= stage2_left_ball_avoid_center_px；
-        3. 球深度足够近：depth_m <= stage2_left_ball_avoid_depth_m；
-        4. 球半径达到最小值，避免小噪声触发。
+        1. RGB-only 蓝球/橙球候选通过原有 HSV + min_contour_area；
+        2. 球位于图像中心左侧；
+        3. image_center_x - cx <= stage2_left_ball_avoid_center_px；
+        4. area >= stage2_left_ball_avoid_min_area；
+        5. radius >= stage2_left_ball_avoid_min_radius。
+
+        满足后固定向右规避。
         """
         if not self.stage2_left_ball_avoid_enabled:
             return None
         if ball is None or ball.get('img_shape') is None:
             return None
 
-        h, w = ball['img_shape']
+        _, w = ball['img_shape']
         image_center_x = w / 2.0
 
         candidates = []
-        for b in ball.get('orange_balls', []) + ball.get('blue_balls', []):
+        for b in ball.get('stage2_avoid_rgb_balls', []):
             center = b.get('center')
-            depth_m = b.get('depth_m')
+            area = float(b.get('area', 0.0))
             radius = float(b.get('radius', 0.0))
-            if center is None or depth_m is None:
+            if center is None:
                 continue
 
             cx = float(center[0])
@@ -1871,8 +2336,10 @@ class Stage2Node(StageNodeBase):
             dist_to_center_px = image_center_x - cx
             if dist_to_center_px > self.stage2_left_ball_avoid_center_px:
                 continue
-            if float(depth_m) > self.stage2_left_ball_avoid_depth_m:
+
+            if area < self.stage2_left_ball_avoid_min_area:
                 continue
+
             if radius < self.stage2_left_ball_avoid_min_radius:
                 continue
 
@@ -1885,8 +2352,15 @@ class Stage2Node(StageNodeBase):
         if not candidates:
             return None
 
-        # 优先避让最近的；如果深度接近，再优先避让更靠近图像中心的。
-        return min(candidates, key=lambda b: (float(b.get('depth_m', 999.0)), float(b.get('stage2_avoid_dist_to_center_px', 9999.0))))
+        # 不再有深度可用于“最近”排序。
+        # 优先选择最靠近机器狗前进中线的球；距离相同时优先半径更大的球。
+        return min(
+            candidates,
+            key=lambda b: (
+                float(b.get('stage2_avoid_dist_to_center_px', 9999.0)),
+                -float(b.get('radius', 0.0)),
+            )
+        )
 
     def compute_stage2_left_ball_avoid_vy(self, ball: Dict) -> float:
         """
@@ -1943,9 +2417,10 @@ class Stage2Node(StageNodeBase):
         self.stage2_left_ball_avoid_debug = debug
 
         self.get_logger().info(
-            f'[STAGE2_LEFT_BALL_AVOID] danger={danger.get("color")} '
-            f'center={danger.get("center")}, depth={danger.get("depth_m")}, '
-            f'radius={danger.get("radius", 0.0):.1f}, '
+            f'[STAGE2_LEFT_BALL_AVOID] RGB_ONLY danger={danger.get("color")} '
+            f'center={danger.get("center")}, '
+            f'area={danger.get("area", 0.0):.0f}/{self.stage2_left_ball_avoid_min_area:.0f}, '
+            f'radius={danger.get("radius", 0.0):.1f}/{self.stage2_left_ball_avoid_min_radius:.1f}, '
             f'dist_to_center={danger.get("stage2_avoid_dist_to_center_px", 0.0):.1f}/'
             f'{self.stage2_left_ball_avoid_center_px:.1f}px, '
             f'counter={self.stage2_left_ball_avoid_counter}/{confirm_frames}, '
@@ -2035,10 +2510,8 @@ class Stage2Node(StageNodeBase):
             return self.yellow_stop_line_y_ratio_stage1
         if self.state == 'STAGE2_CRUISE_YELLOW_ONLY':
             return self.yellow_stop_line_y_ratio_stage2
-        if self.state == 'STAGE3_CRUISE_BALL_ONLY':
+        if self.state == 'STAGE3_PRE180_CENTER_YELLOW':
             return self.yellow_stop_line_y_ratio_stage3
-        if self.state == 'STAGE3_GO_SCAN':
-            return self.yellow_ratio_scan
         if self.state == 'STAGE3_GO_FINAL':
             return self.yellow_ratio_final
         return None
@@ -2062,8 +2535,6 @@ class Stage2Node(StageNodeBase):
             cv2.line(vis, (0, image_center_y), (w - 1, image_center_y), (80, 80, 80), 1)
 
             cv2.putText(vis, f'state={self.state}', (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)
-            cv2.putText(vis, f'orange_hit_count={self.orange_hit_count}', (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
-                        (255, 255, 255), 2)
 
             # 画黄色 ROI
             roi_top = int(h * self.yellow_roi_top_ratio)
@@ -2380,13 +2851,12 @@ class Stage2Node(StageNodeBase):
     def finish_ball_task_and_return(self, x: float, y: float, yaw: float):
         self.last_ball_done_time_sec = self.now_sec()
         self.last_ball_done_pose = (x, y, yaw)
-        self.orange_hit_count += 1
         self.mark_fisheye_side_hit(
             return_state=self.ball_return_state,
             side=self.fisheye_target_side
         )
         self.get_logger().info(
-            f'Ball task finished. orange_hit_count={self.orange_hit_count} | '
+            f'Ball task finished | '
             f'last_ball_done_time_sec={self.last_ball_done_time_sec:.2f} | '
             f'last_ball_done_pose=({x:.3f}, {y:.3f}, {yaw:.3f})'
         )
@@ -2547,7 +3017,24 @@ class Stage2Node(StageNodeBase):
     # 主循环（原 control_loop 的第二赛段部分；P1/P3 分发已拆到各自节点）
     # ============================================================
     def stage_control_loop(self):
-        self.update_fisheye_entry_counters()
+        # StageNodeBase 的定时器以 30 Hz 唤醒本函数：
+        # 普通状态只放行 5 Hz；固定时间转向状态每一拍都放行，即 30 Hz。
+        if not self.stage2_control_tick_due():
+            return
+
+        timed_turn_state = self.is_stage2_timed_turn_state()
+        if not timed_turn_state:
+            # 先处理这一拍到来前缓存的最新视觉，再用结果做状态机判断。
+            # 普通状态因此真正做到控制 5 Hz + 视觉最多 5 Hz。
+            self.process_stage2_latest_vision()
+            if self.state in (
+                    'STAGE1_CRUISE_BALL_AND_YELLOW',
+                    'STAGE3_GO_FINAL'):
+                self.update_fisheye_entry_counters()
+            else:
+                self.fisheye_left_entry_counter = 0
+                self.fisheye_right_entry_counter = 0
+
         pose = self.get_current_pose()
 
         # TF 现在不是状态机运行的必要条件。
@@ -2571,9 +3058,23 @@ class Stage2Node(StageNodeBase):
         ball = self.latest_ball_result
         yellow = self.latest_yellow_result
 
-        if ball['img_shape'] is not None:
+        # RGB 依赖状态必须基于持续到来的新图像运行。若相机/回调卡住，
+        # 保持 gait 心跳但把速度清零（原地踏步），直到新 RGB 恢复。
+        if (not timed_turn_state) and self.state in self.stage2_rgb_required_states:
+            rgb_age = self.rgb_age_s()
+            if rgb_age is None or rgb_age > self.stage2_rgb_stale_timeout_s:
+                age_text = 'none' if rgb_age is None else f'{rgb_age:.3f}s'
+                self.get_logger().warning(
+                    f'[P2_RGB_STALE] state={self.state}, rgb_age={age_text}, '
+                    f'timeout={self.stage2_rgb_stale_timeout_s:.3f}s -> zero velocity',
+                    throttle_duration_sec=0.5
+                )
+                self.send_velocity_command(0.0, 0.0, 0.0)
+                return
+
+        if (not timed_turn_state) and ball['img_shape'] is not None:
             self.get_logger().info(
-                f"state={self.state} | orange_hit_count={self.orange_hit_count} | "
+                f"state={self.state} | "
                 f"has_ball={ball['has_ball']} | ball_center={ball['ball_center']} | "
                 f"ball_depth={ball['ball_depth_m']} | ball_radius={ball['ball_radius']} | "
                 f"ball_error_x={ball['error_x']} | has_center_ref={ball['has_center_reference']} | "
@@ -2600,7 +3101,8 @@ class Stage2Node(StageNodeBase):
         if self.state == 'STAGE1_ROTATE_LEFT_90':
             self.execute_timed_turn(
                 wz=self.timed_turn_wz_90,
-                duration_sec=self.timed_turn_duration_90_sec,
+                # 仅第一次 90° 使用 3.95s。
+                duration_sec=self.stage1_timed_turn_duration_90_sec,
                 next_state='STAGE2_CRUISE_YELLOW_ONLY'
             )
             return
@@ -2609,7 +3111,48 @@ class Stage2Node(StageNodeBase):
             self.execute_timed_turn(
                 wz=self.timed_turn_wz_90,
                 duration_sec=self.timed_turn_duration_90_sec,
-                next_state='STAGE2_MOVE_FORWARD_AFTER_LEFT_JUMP_TIME'
+                # 第二次90°前的左移已经完成；转向后直接进入第三条直道。
+                next_state='STAGE3_PRE180_CENTER_YELLOW'
+            )
+            return
+
+        if self.state == 'STAGE2_LEFT_SHIFT_BEFORE_SECOND_90':
+            now_sec = self.now_sec()
+
+            if self.stage2_before_second_90_left_shift_start_time_sec is None:
+                self.stage2_before_second_90_left_shift_start_time_sec = now_sec
+                self.get_logger().info(
+                    f'[PRE_SECOND_90_LEFT_SHIFT] start: '
+                    f'duration={self.stage2_before_second_90_left_shift_duration_sec:.2f}s, '
+                    f'vy=+{self.stage2_before_second_90_left_shift_speed:.3f}'
+                )
+
+            self.stage2_before_second_90_left_shift_start_time_sec = self.align_motion_timer_start(
+                self.stage2_before_second_90_left_shift_start_time_sec, now_sec)
+            elapsed = max(
+                0.0,
+                now_sec - self.stage2_before_second_90_left_shift_start_time_sec
+            )
+
+            if elapsed >= self.stage2_before_second_90_left_shift_duration_sec:
+                self.get_logger().info(
+                    f'[PRE_SECOND_90_LEFT_SHIFT] done: elapsed={elapsed:.2f}s '
+                    f'-> STAGE2_ROTATE_LEFT_90'
+                )
+                self.stage2_before_second_90_left_shift_start_time_sec = None
+
+                # 左移完成后进入第二次90°。
+                # execute_timed_turn() 会先原地踏步0.5s，再开始3.85s转向。
+                self.set_state('STAGE2_ROTATE_LEFT_90')
+                return
+
+            # vy > 0 为向左。
+            # 保持第二赛段正常前倾姿态；该固定动作期间视觉关闭。
+            self.send_velocity_command(
+                0.0,
+                self.stage2_before_second_90_left_shift_speed,
+                0.0,
+                step_height=self.stage2_velocity_step_height
             )
             return
 
@@ -2617,7 +3160,7 @@ class Stage2Node(StageNodeBase):
             self.execute_timed_turn(
                 wz=self.timed_turn_wz_180,
                 duration_sec=self.timed_turn_duration_180_sec,
-                next_state='STAGE3_FINAL_DECISION'
+                next_state='STAGE3_GO_FINAL'
             )
             return
 
@@ -2659,11 +3202,34 @@ class Stage2Node(StageNodeBase):
             return
 
         if self.state == 'STAGE3_FINAL_ROTATE_AFTER_LEFT_SHIFT':
-            # 最终出口前的转向阶段：不再使用 TF yaw 闭环。
-            # 按仿真时间发送 wz，到时后进入 DONE，由 DONE 统一 STOP。
+            # 最终出口前的固定转向同样先原地踏步 0.5s 恢复水平姿态。
             now_sec = self.now_sec()
+
+            if self.timed_turn_pre_stand_start_time_sec is None:
+                self.timed_turn_pre_stand_start_time_sec = now_sec
+                self.get_logger().info(
+                    f'[PRE_TURN_STAND] final rotate start: '
+                    f'duration={self.timed_turn_pre_stand_duration_sec:.2f}s'
+                )
+
+            self.timed_turn_pre_stand_start_time_sec = self.align_motion_timer_start(
+                self.timed_turn_pre_stand_start_time_sec, now_sec)
+            prep_elapsed = max(
+                0.0, now_sec - self.timed_turn_pre_stand_start_time_sec)
+
+            if prep_elapsed < self.timed_turn_pre_stand_duration_sec:
+                self.send_velocity_command(
+                    0.0, 0.0, 0.0,
+                    step_height=self.timed_turn_step_height
+                )
+                return
+
+            # 预恢复结束后才开始统计最终转向的 1.5s。
             if self.stage3_final_rotate_start_time_sec is None:
                 self.stage3_final_rotate_start_time_sec = now_sec
+                self.get_logger().info(
+                    f'[PRE_TURN_STAND] final rotate done: elapsed={prep_elapsed:.2f}s'
+                )
                 self.get_logger().info(
                     f'STAGE3_FINAL_ROTATE_AFTER_LEFT_SHIFT start time-based rotate: '
                     f'sim_time_start={now_sec:.3f}s, '
@@ -2682,22 +3248,24 @@ class Stage2Node(StageNodeBase):
             )
 
             if elapsed >= self.stage3_final_rotate_duration_sec:
+                self.timed_turn_pre_stand_start_time_sec = None
                 # 第二赛段结束后直接进入第三赛段入口；不先进入 DONE，避免提前全流程停止。
                 self.complete_stage('STAGE3_FINAL_ROTATE_AFTER_LEFT_SHIFT finished')
                 return
 
             # 默认 wz > 0 为左转。
-            # 如果实测转向反了，把 abs(...) 改成 -abs(...)。
             self.send_velocity_command(0.0, 0.0, abs(self.stage3_final_rotate_wz))
             return
 
         if self.state == 'STAGE1_CRUISE_BALL_AND_YELLOW':
-            if self.stage1_yellow_passed(yellow):
-                self.set_state('STAGE1_FORWARD_BEFORE_ROTATE')
-                return
-
+            # 同一拍同时看到橙球和黄线时，橙球优先。
+            # 完整撞击 + 回退结束返回巡航后，再重新处理最新黄线。
             if self.try_start_fisheye_hit(
                     'STAGE1_CRUISE_BALL_AND_YELLOW', (x, y, yaw)):
+                return
+
+            if self.stage1_yellow_passed(yellow):
+                self.set_state('STAGE1_FORWARD_BEFORE_ROTATE')
                 return
 
             vx = self.get_yellow_slowdown_speed(
@@ -2732,82 +3300,114 @@ class Stage2Node(StageNodeBase):
             self.send_move_right_command(self.right_speed)
             return
 
-        if self.state == 'STAGE2_MOVE_FORWARD_AFTER_LEFT_JUMP':
-            if self.stage2_forward_after_left_jump_start_pose is None:
-                time.sleep(2)
-                self.stage2_forward_after_left_jump_start_pose = (x, y, yaw)
-                self.get_logger().info(
-                    f"Saved stage2_forward_after_left_jump_start_pose = ({x:.3f}, {y:.3f}, {yaw:.3f})"
-                )
-
-            x0, y0, _ = self.stage2_forward_after_left_jump_start_pose
-            dist = math.hypot(x - x0, y - y0)
-
-            self.get_logger().info(
-                f"Stage2 forward after left jump: dist={dist:.3f} / "
-                f"{self.stage2_forward_after_left_jump_distance_m:.3f}",
-                throttle_duration_sec=0.5
-            )
-
-            if dist >= self.stage2_forward_after_left_jump_distance_m - self.stage2_forward_after_left_jump_tolerance_m:
-                self.set_state('STAGE3_CRUISE_BALL_ONLY')
-                return
-
-            self.send_velocity_command(self.stage2_forward_after_left_jump_speed, 0.0, 0.0)
-            return
-
-        if self.state == 'STAGE2_MOVE_FORWARD_AFTER_LEFT_JUMP_TIME':
-            now_sec = self.now_sec()
-            if self.stage2_forward_after_left_jump_start_time_sec is None:
-                self.stage2_forward_after_left_jump_start_time_sec = now_sec
-                self.get_logger().info(
-                    f'STAGE2_MOVE_FORWARD_AFTER_LEFT_JUMP_TIME start: '
-                    f'sim_time_start={now_sec:.3f}s, '
-                    f'duration={self.stage2_forward_after_left_jump_duration_sec:.3f}s, '
-                    f'speed={self.stage2_forward_after_left_jump_speed:.3f}'
-                )
-
-            self.stage2_forward_after_left_jump_start_time_sec = self.align_motion_timer_start(
-                self.stage2_forward_after_left_jump_start_time_sec, now_sec)
-            elapsed = max(0.0, now_sec - self.stage2_forward_after_left_jump_start_time_sec)
-            self.get_logger().info(
-                f'STAGE2_MOVE_FORWARD_AFTER_LEFT_JUMP_TIME elapsed='
-                f'{elapsed:.3f}/{self.stage2_forward_after_left_jump_duration_sec:.3f}s',
-                throttle_duration_sec=0.5
-            )
-
-            if elapsed >= self.stage2_forward_after_left_jump_duration_sec:
-                self.set_state('STAGE3_CRUISE_BALL_ONLY')
-                return
-
-            self.send_velocity_command(self.stage2_forward_after_left_jump_speed, 0.0, 0.0)
-            return
-
         if self.state == 'STAGE2_CRUISE_YELLOW_ONLY':
             if self.yellow_reached(yellow, self.yellow_stop_line_y_ratio_stage2):
-                self.set_state('STAGE2_ROTATE_LEFT_90')
+                # 第二次90°之前先执行定时左移。
+                self.set_state('STAGE2_LEFT_SHIFT_BEFORE_SECOND_90')
                 return
 
+            now_sec = self.now_sec()
+
+            if self.stage2_cruise_after_first_turn_start_time_sec is None:
+                self.stage2_cruise_after_first_turn_start_time_sec = now_sec
+                self.get_logger().info(
+                    f'[STAGE2_AFTER_TURN_CRUISE] start: '
+                    f'delay={self.stage2_after_turn_left_bias_delay_sec:.2f}s, '
+                    f'vx_before={self.stage2_cruise_forward_speed:.3f}, '
+                    f'vx_after={self.stage2_cruise_forward_speed_after_delay:.3f}, '
+                    f'left_bias_vy=+{self.stage2_after_turn_left_bias_vy:.3f}'
+                )
+
+            self.stage2_cruise_after_first_turn_start_time_sec = self.align_motion_timer_start(
+                self.stage2_cruise_after_first_turn_start_time_sec,
+                now_sec
+            )
+            cruise_elapsed = max(
+                0.0,
+                now_sec - self.stage2_cruise_after_first_turn_start_time_sec
+            )
+
+            after_delay = (
+                cruise_elapsed >= self.stage2_after_turn_left_bias_delay_sec
+            )
+
+            base_vx = (
+                self.stage2_cruise_forward_speed_after_delay
+                if after_delay
+                else self.stage2_cruise_forward_speed
+            )
+
+            # 黄线接近时仍保留原本的减速机制。
             vx = self.get_yellow_slowdown_speed(
-                yellow, self.stage2_cruise_forward_speed,
+                yellow,
+                base_vx,
                 self.stage2_yellow_slow_speed,
                 self.yellow_slowdown_ratio_stage2
             )
             wz = self.compute_yellow_angle_align_wz(yellow)
 
-            # 第二赛段不进入撞球逻辑，但会检查左侧蓝球/橙球是否过近。
-            # 如果左侧近球靠近图像中心，就给固定右移 vy，避免左侧擦碰。
+            # RGB-only 小球避障优先级最高。
             avoid_vy = self.compute_stage2_left_ball_avoid_vy(ball)
-            self.send_velocity_command(vx, avoid_vy, wz)
+
+            if abs(avoid_vy) > 1e-6:
+                # 只要真正触发过一次危险小球，就永久锁存。
+                # 之后即使小球消失，本阶段也不再给主动左移偏置。
+                if not self.stage2_danger_ball_seen_once:
+                    self.stage2_danger_ball_seen_once = True
+                    self.get_logger().info(
+                        '[STAGE2_AFTER_TURN_CRUISE] danger ball seen once -> '
+                        'disable left-bias for the rest of this stage'
+                    )
+
+                # 当前正在避球：停止前进，只向右横移。
+                cmd_vx = 0.0
+                cmd_vy = avoid_vy
+                mode = 'BALL_AVOID_STOP_FORWARD'
+
+            else:
+                cmd_vx = vx
+
+                if after_delay and not self.stage2_danger_ball_seen_once:
+                    # 只有 3 秒后、而且整个阶段从未触发过危险小球，
+                    # 才允许主动向左小幅偏移。
+                    cmd_vy = abs(self.stage2_after_turn_left_bias_vy)
+                    mode = 'AFTER_3S_FORWARD_PLUS_LEFT'
+
+                elif after_delay and self.stage2_danger_ball_seen_once:
+                    # 曾经避过一次球：后续只向前，不再主动向左。
+                    cmd_vy = 0.0
+                    mode = 'AFTER_BALL_SEEN_FORWARD_ONLY'
+
+                else:
+                    cmd_vy = 0.0
+                    mode = 'FIRST_3S_FORWARD_ONLY'
+
+            self.get_logger().info(
+                f'[STAGE2_AFTER_TURN_CRUISE] '
+                f'elapsed={cruise_elapsed:.2f}s, '
+                f'mode={mode}, '
+                f'avoid_active={abs(avoid_vy) > 1e-6}, '
+                f'danger_seen_once={self.stage2_danger_ball_seen_once}, '
+                f'cmd=({cmd_vx:+.3f},{cmd_vy:+.3f},{wz:+.3f})',
+                throttle_duration_sec=0.3
+            )
+
+            self.send_velocity_command(
+                cmd_vx,
+                cmd_vy,
+                wz
+            )
             return
 
-        if self.state == 'STAGE3_CRUISE_BALL_ONLY':
-            if self.yellow_reached(yellow, self.yellow_stop_line_y_ratio_stage3):
+        if self.state == 'STAGE3_PRE180_CENTER_YELLOW':
+            # 第二次90°后：不启用鱼眼橙球撞击。
+            # RGB 用于左右参考球居中，同时识别前方黄线。
+            # 黄线判定完全复用旧 STAGE3_CRUISE_BALL_ONLY 的参数。
+            if self.yellow_reached(
+                    yellow, self.yellow_stop_line_y_ratio_stage3):
+                # 第二次90°前的定时左移已经完成。
+                # 这里黄线到达后直接进入180°；180°状态内部仍会先踏步0.5s。
                 self.set_state('STAGE3_ROTATE_BACK_180')
-                return
-
-            if self.try_start_fisheye_hit(
-                    'STAGE3_CRUISE_BALL_ONLY', (x, y, yaw)):
                 return
 
             vx = self.get_yellow_slowdown_speed(
@@ -2819,37 +3419,14 @@ class Stage2Node(StageNodeBase):
             self.send_center_cruise_command_with_wz(ball, vx, wz)
             return
 
-        if self.state == 'STAGE3_FINAL_DECISION':
-            if self.orange_hit_count >= 4:
-                self.get_logger().info('已完成4个橙球，直接前往最终出口线')
-                self.set_state('STAGE3_GO_FINAL')
-            else:
-                self.get_logger().info('当前只完成3个橙球，先前往0.6位置补扫最后一个球')
-                self.set_state('STAGE3_GO_SCAN')
-            return
-
-        if self.state == 'STAGE3_GO_SCAN':
-            if self.yellow_reached(yellow, self.yellow_ratio_scan):
-                self.set_state('STAGE3_SCAN_AND_HIT_LAST')
-                return
-
-            vx = self.get_yellow_slowdown_speed(
-                yellow, self.stage3_go_scan_speed,
-                self.stage3_go_scan_yellow_slow_speed,
-                self.yellow_slowdown_ratio_scan
-            )
-            wz = self.compute_yellow_angle_align_wz(yellow)
-            self.send_center_cruise_command_with_wz(ball, vx, wz)
-            return
-
-        if self.state == 'STAGE3_SCAN_AND_HIT_LAST':
-            if self.try_start_fisheye_hit('STAGE3_GO_FINAL', (x, y, yaw)):
-                return
-
-            self.send_center_cruise_command(ball, self.stage3_go_scan_speed)
-            return
-
         if self.state == 'STAGE3_GO_FINAL':
+            # 180° 后开始启用鱼眼橙球。
+            # 如果橙球和最终黄线同一拍同时满足，仍然让橙球优先；
+            # 撞击和回退完成后返回 STAGE3_GO_FINAL，再继续处理最终黄线。
+            if self.try_start_fisheye_hit(
+                    'STAGE3_GO_FINAL', (x, y, yaw)):
+                return
+
             if self.yellow_reached(yellow, self.yellow_ratio_final):
                 self.set_state('STAGE3_FORWARD_AFTER_GO_FINAL')
                 return
@@ -2860,11 +3437,8 @@ class Stage2Node(StageNodeBase):
                 self.yellow_slowdown_ratio_final
             )
 
-            # STAGE3_GO_FINAL 不做黄线角度矫正：
-            # 这里只保留原来的黄线到底判断和预减速逻辑。
-            # 中线对齐仍然使用固定 vy 横向平移。
-            # 如果你连中线横移也不想要，可以把下一行改成：
-            # self.send_velocity_command(vx, 0.0, 0.0)
+            # GO_FINAL 恢复 RGB 中线居中，但不做黄线角度 wz 矫正。
+            # vy 由左右 RGB 参考球计算，wz 固定为 0。
             self.send_center_cruise_command_with_wz(ball, vx, 0.0)
             return
 
