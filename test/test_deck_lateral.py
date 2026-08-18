@@ -403,3 +403,189 @@ def test_integral_cancels_a_constant_disturbance_a_p_loop_cannot():
     integral = walk(integral_controller())
     assert proportional < -0.03                 # standing error remains
     assert abs(integral) < 0.01                 # trim removed it
+
+
+# --- forward-stall freeze ------------------------------------------------
+#
+# A body that is not advancing cannot turn.  These cover the three things the
+# freeze has to get right: drop wz, keep vy, and do not throw away the trim.
+
+
+def test_stall_drops_the_turn_term():
+    """wz must go to zero while the body is not advancing."""
+    controller = engaged_controller()
+    moving = controller.update(obs(0.0, heading=0.40), now_s=1.0)
+    assert moving.wz != 0.0
+    stalled = controller.update(
+        obs(0.0, heading=0.40), now_s=1.1, forward_stalled=True)
+    assert stalled.wz == 0.0
+
+
+def test_stall_keeps_the_lateral_term():
+    """vy centring is what walks the robot onto the deck; it must survive."""
+    controller = engaged_controller()
+    cmd = controller.update(obs(0.20), now_s=1.0, forward_stalled=True)
+    assert cmd.vy > 0.0
+
+
+def test_stall_freezes_the_trim_rather_than_zeroing_it():
+    """The offset is still real, so the accumulated trim is still earned."""
+    controller = engaged_controller(k_i_vy=0.5, max_i_vy=0.20)
+    t = 0.0
+    for _ in range(10):                       # wind the integral up on a real error
+        t += 0.1
+        controller.update(obs(0.10), now_s=t)
+    wound = controller.update(obs(0.10), now_s=t).vy_integral
+    assert wound > 0.0
+
+    for _ in range(10):                       # stall: it must neither grow nor reset
+        t += 0.1
+        cmd = controller.update(obs(0.10), now_s=t, forward_stalled=True)
+    assert cmd.vy_integral == pytest.approx(wound)
+    assert cmd.vy >= wound                    # and it still contributes to vy
+
+
+def test_trim_resumes_accumulating_after_the_stall_clears():
+    """Freezing must not latch: the clock restarts, it does not stop."""
+    controller = engaged_controller(k_i_vy=0.5, max_i_vy=0.20)
+    t = 0.0
+    for _ in range(5):
+        t += 0.1
+        controller.update(obs(0.10), now_s=t, forward_stalled=True)
+    frozen = controller.update(obs(0.10), now_s=t).vy_integral
+    for _ in range(5):
+        t += 0.1
+        cmd = controller.update(obs(0.10), now_s=t)
+    assert cmd.vy_integral > frozen
+
+
+def test_stall_suppresses_the_held_turn_on_a_dropout():
+    """A stale replay must not smuggle the frozen wz back in."""
+    controller = engaged_controller()
+    controller.update(obs(0.0, heading=0.40), now_s=1.0)
+    held = controller.update(None, now_s=1.1, forward_stalled=True)
+    assert held.state == CONTROL_HOLDING
+    assert held.wz == 0.0
+
+
+def test_stall_replays_the_measured_entrance_step_runaway():
+    """The signature this exists for: saturated wz against a growing error.
+
+    Replays the measured entrance-step lock (progress pinned, heading error
+    -0.134 -> -0.563 rad while wz sat on its bound).  Without the freeze the
+    loop keeps commanding a turn it cannot execute; with it, wz is zero for
+    every tick of the stall.
+    """
+    headings = [-0.134, -0.495, -0.518, -0.563]
+    free = engaged_controller()
+    unfrozen = [free.update(obs(0.12, heading=h), now_s=1.0 + 0.1 * i).wz
+                for i, h in enumerate(headings)]
+    assert all(w != 0.0 for w in unfrozen)
+
+    held = engaged_controller()
+    frozen = [held.update(obs(0.12, heading=h), now_s=1.0 + 0.1 * i,
+                          forward_stalled=True).wz
+              for i, h in enumerate(headings)]
+    assert frozen == [0.0, 0.0, 0.0, 0.0]
+
+
+def test_stall_can_be_configured_to_back_the_crab_off():
+    """The crab gets the same treatment as the turn term, when asked."""
+    controller = engaged_controller(stall_vy_scale=0.0)
+    free = controller.update(obs(0.20), now_s=1.0)
+    assert free.vy > 0.0
+    stalled = controller.update(obs(0.20), now_s=1.1, forward_stalled=True)
+    assert stalled.vy == 0.0
+
+
+def test_stall_vy_scale_defaults_to_no_change():
+    """Opt-in: an unconfigured profile behaves exactly as before."""
+    controller = engaged_controller()
+    free = controller.update(obs(0.20), now_s=1.0).vy
+    stalled = controller.update(
+        obs(0.20), now_s=1.1, forward_stalled=True).vy
+    assert stalled == pytest.approx(free)
+
+
+def test_stall_vy_scale_is_partial_not_just_on_or_off():
+    """A half-authority crab must actually be half."""
+    controller = engaged_controller(stall_vy_scale=0.5)
+    free = controller.update(obs(0.20), now_s=1.0).vy
+    stalled = controller.update(
+        obs(0.20), now_s=1.1, forward_stalled=True).vy
+    assert stalled == pytest.approx(0.5 * free, abs=1e-6)
+
+
+def test_stall_vy_scale_replays_the_measured_pinned_crab():
+    """Both measured stalls held vy on its bound; scaling must unpin it."""
+    for offset in (-0.199, -0.081):
+        controller = engaged_controller(stall_vy_scale=0.0, max_vy=0.18)
+        pinned = controller.update(obs(offset), now_s=1.0).vy
+        assert abs(pinned) > 0.01                 # the loop does want to crab
+        released = controller.update(
+            obs(offset), now_s=1.1, forward_stalled=True).vy
+        assert released == 0.0
+
+
+# --- futile-turn detection ----------------------------------------------
+#
+# The direct signal the progress-based freeze was a proxy for: wz pinned on
+# its bound with the heading error still growing.
+
+
+def _drive(controller, headings, t0=1.0, dt=0.1):
+    return [controller.update(obs(0.0, heading=h), now_s=t0 + dt * i)
+            for i, h in enumerate(headings)]
+
+
+def test_futile_detection_is_off_by_default():
+    """Opt-in: an unconfigured profile keeps steering exactly as before."""
+    controller = engaged_controller()
+    out = _drive(controller, [0.30, 0.45, 0.60, 0.75, 0.90])
+    assert all(c.wz != 0.0 for c in out)
+
+
+def test_saturated_wz_against_a_growing_error_is_dropped():
+    """The measured entrance-step signature, caught by the actuator itself."""
+    controller = engaged_controller(wz_futile_samples=2)
+    out = _drive(controller, [0.356, 0.450, 0.520, 0.572, 0.600])
+    assert out[0].wz != 0.0                    # first tick has no history
+    assert out[-1].wz == 0.0                   # and it has given up by the end
+
+
+def test_a_working_turn_is_never_suppressed():
+    """A saturated turn that is shrinking the error must keep its authority."""
+    controller = engaged_controller(wz_futile_samples=2)
+    out = _drive(controller, [0.60, 0.50, 0.40, 0.30, 0.20])
+    assert all(c.wz != 0.0 for c in out)
+
+
+def test_an_unsaturated_turn_is_never_suppressed():
+    """Below the bound the loop still has headroom; growth is not futility."""
+    controller = engaged_controller(wz_futile_samples=2, max_wz=5.0)
+    out = _drive(controller, [0.10, 0.20, 0.30, 0.40, 0.50])
+    assert all(c.wz != 0.0 for c in out)
+
+
+def test_suppression_releases_when_the_error_improves():
+    """It must let go — a latch with no release is a permanent disable."""
+    controller = engaged_controller(wz_futile_samples=2)
+    _drive(controller, [0.356, 0.450, 0.520, 0.572])
+    assert controller.update(obs(0.0, heading=0.600), now_s=2.0).wz == 0.0
+    recovered = controller.update(obs(0.0, heading=0.300), now_s=2.1)
+    assert recovered.wz != 0.0
+
+
+def test_suppression_does_not_chatter_once_engaged():
+    """Dropping wz un-saturates it; an edge test would clear straight away."""
+    controller = engaged_controller(wz_futile_samples=2)
+    _drive(controller, [0.356, 0.450, 0.520])
+    held = _drive(controller, [0.560, 0.580, 0.600, 0.620], t0=2.0)
+    assert all(c.wz == 0.0 for c in held)
+
+
+def test_a_sign_flip_is_not_growth():
+    """Crossing zero and growing the other way is a new situation."""
+    controller = engaged_controller(wz_futile_samples=2)
+    out = _drive(controller, [0.50, -0.55, -0.60])
+    assert out[-1].wz != 0.0
