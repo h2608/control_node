@@ -370,12 +370,31 @@ class BallDetector(BaseDetector):
 
 
 class FootballDetector:
-    """Adapt the shared football detector to Stage 4's Detection interface."""
+    """Adapt the shared football detector to Stage 4's Detection interface.
+
+    The detector itself is memoryless, so this adapter owns the one piece of
+    state it needs: the previous accepted centre, handed back as
+    ``prefer_center`` to break ties between candidates.  It is only a
+    tie-breaker — it cannot drag the lock onto a candidate the gates rejected,
+    and it is dropped after ``forget_after_misses`` consecutive misses so a
+    ball that has genuinely moved is re-acquired rather than chased.
+    """
+
+    def __init__(self, forget_after_misses: int = 5):
+        self.forget_after_misses = max(1, int(forget_after_misses))
+        self._last_center: Optional[Tuple[float, float]] = None
+        self._consecutive_misses = 0
 
     def detect(self, frame_bgr, depth_at=None) -> Optional[Detection]:
-        result = detect_football(frame_bgr, depth_at=depth_at)
+        result = detect_football(
+            frame_bgr, depth_at=depth_at, prefer_center=self._last_center)
         if result is None:
+            self._consecutive_misses += 1
+            if self._consecutive_misses >= self.forget_after_misses:
+                self._last_center = None
             return None
+        self._consecutive_misses = 0
+        self._last_center = (float(result['x']), float(result['y']))
 
         height, width = frame_bgr.shape[:2]
         x = float(result['x'])

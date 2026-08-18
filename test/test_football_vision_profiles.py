@@ -104,3 +104,89 @@ def inspect_source(module):
     import inspect
 
     return inspect.getsource(module)
+
+
+def decoy_scene(ball, decoy, width=640, height=480):
+    """A ball plus one big pale disc -- the shape that beat it on hardware.
+
+    ``ball`` and ``decoy`` are ``(cx, cy, radius)``.  The decoy gets a single
+    dark blob rather than separate panels: enough dark pixels to clear the
+    black-fraction gate and become a candidate, but no panel structure.  Only
+    a score that rewards size or nearness can rank it above the ball.
+    """
+    image = ball_scene(ball[0], ball[1], ball[2], width, height)
+    cv2.circle(image, (decoy[0], decoy[1]), decoy[2], (225, 225, 228), -1)
+    cv2.circle(image, (decoy[0], decoy[1]), decoy[2], (120, 120, 120), 2)
+    cv2.circle(image, (decoy[0], decoy[1] - decoy[2] // 5),
+               max(4, decoy[2] // 3), (35, 35, 35), -1)
+    image = cv2.GaussianBlur(image, (3, 3), 0.8)
+    noise = np.random.RandomState(1).randint(-6, 7, image.shape)
+    return np.clip(image.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+
+def test_evidence_score_prefers_the_ball_over_a_bigger_nearer_blob():
+    """The measured hardware failure: a large near blob outscored the ball.
+
+    On the spare robot a bright floor blob at 0.29 m scored 5.87 under the
+    legacy ``2.8 * radius_score + 0.35 / depth`` while the real ball scored
+    4.00.  The evidence score must not have that preference.
+    """
+    scene = decoy_scene(ball=(240, 300, 26), decoy=(430, 330, 62))
+
+    def depth_at(x, y):
+        return 0.5 if x > 340 else 1.9
+
+    found = detect_football(scene, depth_at=depth_at)
+    assert found is not None
+    assert found['x'] == pytest.approx(240, abs=25), (
+        'evidence scoring locked onto the decoy at %.0f' % found['x'])
+
+    # The same frame under the old ranking picks the decoy, which is what
+    # makes this scene a regression test rather than a tautology.
+    legacy = detect_football(scene, depth_at=depth_at, score_mode='legacy')
+    assert legacy is not None
+    assert legacy['x'] == pytest.approx(430, abs=25)
+
+
+def test_legacy_score_is_still_reachable_for_stage6():
+    """Stage 6 keeps the old ranking until its castor bench is redone."""
+    assert NEAR_BALL['score_mode'] == 'legacy'
+    assert NEAR_BALL['blur_ksize'] == 9
+    assert NEAR_BALL['blur_sigma'] == 1.8
+
+
+def test_prefer_center_is_a_tie_breaker_not_an_override():
+    """Continuity must not let a stale track drag the lock off the ball."""
+    scene = decoy_scene(ball=(240, 300, 26), decoy=(430, 330, 30))
+
+    def depth_at(x, y):
+        return 1.9
+
+    free = detect_football(scene, depth_at=depth_at)
+    assert free is not None and free['x'] == pytest.approx(240, abs=25)
+
+    # Pointing continuity straight at the decoy does not move the lock:
+    # the ball still wins on its own evidence.
+    dragged = detect_football(
+        scene, depth_at=depth_at, prefer_center=(430, 330))
+    assert dragged is not None
+    assert dragged['x'] == pytest.approx(240, abs=25)
+
+    # Continuity does raise the score of the candidate it points at, which is
+    # what breaks a tie between two otherwise equal candidates.
+    held = detect_football(scene, depth_at=depth_at, prefer_center=(240, 300))
+    assert held is not None
+    assert held['score'] > free['score']
+
+
+def test_prefer_center_never_invents_a_candidate():
+    """An empty floor stays empty however confident the previous track was."""
+    empty = np.full((480, 640, 3), 150, np.uint8)
+    assert detect_football(
+        empty, depth_at=constant_depth(1.9), prefer_center=(320, 300)) is None
+
+
+def test_default_pre_blur_keeps_the_two_metre_ball_a_candidate():
+    """A ~22 px ball is what 2 m looks like; the old 9x9 kernel erased it."""
+    scene = ball_scene(320, 300, 22)
+    assert detect_football(scene, depth_at=constant_depth(1.9)) is not None
