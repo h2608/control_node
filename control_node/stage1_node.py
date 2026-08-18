@@ -15,7 +15,7 @@ import numpy as np
 
 import rclpy
 
-from control_node.stage_common import StageNodeBase, clamp
+from control_node.stage_common import StageNodeBase, clamp, find_contours
 from control_node.stage_entry import EntryPoint, StageEntryTable
 
 
@@ -390,7 +390,7 @@ class Stage1Node(StageNodeBase):
 
         if cv2.countNonZero(mask_stop) > self.p1_stop_yellow_pixel_threshold:
             stop_flag = 1.0
-            contours, _ = cv2.findContours(mask_stop, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours = find_contours(mask_stop)
             if contours:
                 c = max(contours, key=cv2.contourArea)
                 rect = cv2.minAreaRect(c)
@@ -433,7 +433,7 @@ class Stage1Node(StageNodeBase):
         lower_blue = np.array([self.p1_blue_h_min, self.p1_blue_s_min, self.p1_blue_v_min], dtype=np.uint8)
         upper_blue = np.array([self.p1_blue_h_max, self.p1_blue_s_max, self.p1_blue_v_max], dtype=np.uint8)
         mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
-        contours, _ = cv2.findContours(mask_blue, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = find_contours(mask_blue)
 
         valid_depths = []
         dh, dw = self.latest_depth.shape[:2]

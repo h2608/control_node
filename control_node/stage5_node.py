@@ -65,7 +65,7 @@ from control_node.route_model import (
     odometry_exit_reached,
     verify_yaw,
 )
-from control_node.stage_common import StageNodeBase
+from control_node.stage_common import StageNodeBase, find_contours
 from control_node.stage_entry import EntryPoint, StageEntryTable
 
 
@@ -3783,7 +3783,7 @@ class Stage5Node(StageNodeBase):
         self.latest_p5_yellow_mask = mask
         self.latest_p5_yellow_roi = (roi_left, roi_top, roi_right, h)
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = find_contours(mask)
 
         best_contour = None
         best_score = -1.0
@@ -3964,7 +3964,7 @@ class Stage5Node(StageNodeBase):
 
         bbox = None
         if yellow_pixels > 0:
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours = find_contours(mask)
             valid_contours = [c for c in contours if cv2.contourArea(c) > 5.0]
             if valid_contours:
                 all_pts = np.vstack(valid_contours)
@@ -4035,7 +4035,7 @@ class Stage5Node(StageNodeBase):
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = find_contours(mask)
 
         candidates = []
 

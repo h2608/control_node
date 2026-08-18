@@ -10,6 +10,8 @@ import math
 import time
 from typing import Optional, Tuple
 
+import cv2
+
 from cv_bridge import CvBridge
 
 from rclpy.node import Node
@@ -66,6 +68,20 @@ def mission_signal_qos(depth: int = 10) -> QoSProfile:
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
+
+def find_contours(mask, mode=cv2.RETR_EXTERNAL, method=cv2.CHAIN_APPROX_SIMPLE):
+    """跨 OpenCV 版本的 findContours：只返回 contours 列表。
+
+    物理机是 **OpenCV 3.2.0**，findContours 返回 (image, contours, hierarchy)
+    三个值；仿真容器是 OpenCV 4.2.0，只返回 (contours, hierarchy) 两个值。
+    ``contours, _ = cv2.findContours(...)`` 在容器里跑得好好的，上机后第一帧就
+    ``ValueError: too many values to unpack (expected 2)``，节点直接死掉 ——
+    2026-08-18 第一赛段实测就是这样：站立指令发出去 0.1 s 后节点崩溃。
+
+    ``[-2]`` 在两个版本里都指向 contours。
+    """
+    return cv2.findContours(mask, mode, method)[-2]
 
 
 def quat_to_yaw(x: float, y: float, z: float, w: float) -> float:

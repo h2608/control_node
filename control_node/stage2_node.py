@@ -19,7 +19,7 @@ import rclpy
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 
-from control_node.stage_common import StageNodeBase, clamp
+from control_node.stage_common import StageNodeBase, clamp, find_contours
 from control_node.stage_entry import (
     EntryPoint,
     StageEntryTable,
@@ -1065,7 +1065,7 @@ class Stage2Node(StageNodeBase):
         kernel = np.ones((self.fisheye_morph_kernel_size, self.fisheye_morph_kernel_size), dtype=np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = find_contours(mask)
         candidates = []
         for contour in contours:
             area = float(cv2.contourArea(contour))
@@ -1260,7 +1260,7 @@ class Stage2Node(StageNodeBase):
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = find_contours(mask)
 
         candidates = []
         for cnt in contours:
@@ -1480,7 +1480,7 @@ class Stage2Node(StageNodeBase):
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = find_contours(mask)
 
         best_contour = None
         best_score = -1.0

@@ -28,7 +28,7 @@ from std_msgs.msg import Bool, String
 from control_node.cola_detector import HybridColaDetector
 from control_node.football_vision import detect_football
 from control_node.my_gait import Robot_Ctrl
-from control_node.stage_common import StageNodeBase, clamp
+from control_node.stage_common import StageNodeBase, clamp, find_contours
 from control_node.stage_entry import EntryPoint, StageEntryTable
 from control_node.stage3_node import P3TrackVisionMixin
 from control_node.cyberdog_voice import CyberdogVoicePlayer
@@ -217,7 +217,7 @@ class BarColorDetector(BaseDetector):
             )
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel_open)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel_close)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = find_contours(mask)
         roi_center_x = roi_w / 2.0
         candidates = []
         for cnt in contours:
@@ -317,7 +317,7 @@ class BallDetector(BaseDetector):
         mask = cv2.inRange(hsv, self.lower, self.upper)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel_open)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel_close)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = find_contours(mask)
         roi_center_x = roi_w / 2.0
         candidates = []
         for cnt in contours:
@@ -551,7 +551,7 @@ class ObstacleBlueDetector:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel_open)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel_close)
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = find_contours(mask)
 
         candidates = []
         debug_infos = []
@@ -796,7 +796,7 @@ class YellowDashedLineDetector:
         return True
 
     def _get_all_yellow_blobs(self, mask):
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = find_contours(mask)
 
         blobs = []
 
@@ -1082,7 +1082,7 @@ class YellowHorizontalLineDetector:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.open_kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.close_kernel)
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = find_contours(mask)
 
         candidates = []
         for cnt in contours:

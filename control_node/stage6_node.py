@@ -17,7 +17,7 @@ import rclpy
 from sensor_msgs.msg import Image
 
 from control_node.robot_control_cmd_lcmt import robot_control_cmd_lcmt
-from control_node.stage_common import StageNodeBase
+from control_node.stage_common import StageNodeBase, find_contours
 from control_node.stage_entry import EntryPoint, StageEntryTable
 
 
@@ -409,7 +409,7 @@ class Stage6Node(StageNodeBase):
 
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = find_contours(mask)
 
         self.wall_angle_rad = 0.0
         self.wall_dist = -1.0
@@ -490,7 +490,7 @@ class Stage6Node(StageNodeBase):
 
         kernel_y = np.ones((9, 9), np.uint8)
         mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_CLOSE, kernel_y)
-        yellow_contours, _ = cv2.findContours(mask_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        yellow_contours = find_contours(mask_yellow)
 
         valid_walls = []
         for c in yellow_contours:
@@ -578,7 +578,7 @@ class Stage6Node(StageNodeBase):
         mask_white = cv2.erode(mask_white, kernel_white, iterations=1)
         mask_white = cv2.dilate(mask_white, kernel_white, iterations=2)
 
-        contours, _ = cv2.findContours(mask_white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = find_contours(mask_white)
         valid_contours = []
         for c in contours:
             ((cx, cy), cr) = cv2.minEnclosingCircle(c)
