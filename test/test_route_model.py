@@ -37,6 +37,7 @@ from control_node.route_model import (
     evaluate_gate,
     normalize_angle_rad,
     verify_yaw,
+    DropoffTrigger,
 )
 
 
@@ -827,3 +828,151 @@ def test_stall_gate_reset_clears_the_latch_and_the_baseline():
     gate.reset()
     assert not gate.snapshot()['tripped']
     assert not gate.record(0.45, 5.00, 10.0)
+
+
+# --- StallGate: latching (fault) vs level (suppression) ------------------
+
+
+def _pinned(gate, ticks, dt=0.1, speed=0.45, progress=0.0):
+    """Drive the gate with a commanded speed and progress that never moves."""
+    out = []
+    t = 0.0
+    for _ in range(ticks):
+        t += dt
+        out.append(gate.record(speed, progress, t))
+    return out
+
+
+def test_latching_gate_fires_exactly_once():
+    """The fault detector's contract: one edge, then silence."""
+    gate = StallGate(min_speed=0.05, timeout_s=1.0, min_progress_m=0.05,
+                     latching=True)
+    fired = _pinned(gate, 30)
+    assert sum(fired) == 1
+
+
+def test_level_gate_stays_true_for_the_whole_stall():
+    """The suppression contract: a level, not an edge.
+
+    This is the bug the option exists for — a latching gate used as a level
+    suppressed the lateral turn term for a single tick and then reported False
+    for the rest of the run.
+    """
+    gate = StallGate(min_speed=0.05, timeout_s=1.0, min_progress_m=0.05,
+                     latching=False)
+    fired = _pinned(gate, 30)
+    assert sum(fired) > 15                    # true for most of the window
+    assert fired[-1] is True
+
+
+def test_level_gate_clears_when_progress_resumes():
+    """It must let go, or it is just a slower latch."""
+    gate = StallGate(min_speed=0.05, timeout_s=1.0, min_progress_m=0.05,
+                     latching=False)
+    _pinned(gate, 30)
+    assert gate.record(0.45, 0.0, 3.1) is True
+    assert gate.record(0.45, 0.5, 3.2) is False       # moved: not stalled
+    assert gate.record(0.45, 0.5, 3.3) is False       # and stays cleared
+
+
+def test_level_gate_needs_the_speed_term_too():
+    """A robot turning in place makes no progress and is not stalled."""
+    gate = StallGate(min_speed=0.05, timeout_s=1.0, min_progress_m=0.05,
+                     latching=False)
+    assert not any(_pinned(gate, 30, speed=0.0))
+
+
+def test_level_gate_re_arms_after_clearing():
+    """A second stall in the same segment must be caught like the first."""
+    gate = StallGate(min_speed=0.05, timeout_s=1.0, min_progress_m=0.05,
+                     latching=False)
+    _pinned(gate, 30)
+    gate.record(0.45, 0.5, 3.2)                       # progress resumes
+    t = 3.2
+    second = []
+    for _ in range(30):
+        t += 0.1
+        second.append(gate.record(0.45, 0.5, t))
+    assert second[-1] is True
+
+
+# --- DropoffTrigger: course-referenced segment end ------------------------
+
+
+def test_dropoff_trigger_is_off_by_default():
+    """Opt-in: a zero threshold must never fire, whatever it is fed."""
+    gate = DropoffTrigger()
+    assert not any(gate.record(d) for d in (0.1, 0.05, 0.0, 0.2))
+
+
+def test_dropoff_trigger_needs_confirmation():
+    """One frame under the threshold is not arrival; the observer is noisy."""
+    gate = DropoffTrigger(trigger_m=1.0, samples=2)
+    assert gate.record(0.9) is False
+    assert gate.record(0.8) is True
+
+
+def test_dropoff_trigger_fires_once():
+    """A segment ends once; there is no situation to return to."""
+    gate = DropoffTrigger(trigger_m=1.0, samples=2)
+    gate.record(0.9)
+    assert gate.record(0.8) is True
+    assert all(gate.record(v) is False for v in (0.7, 0.6, 0.5))
+
+
+def test_a_reading_above_the_threshold_breaks_the_streak():
+    """Evidence that the deck continues must undo partial confirmation."""
+    gate = DropoffTrigger(trigger_m=1.0, samples=2)
+    gate.record(0.9)
+    assert gate.record(1.4) is False        # still deck ahead
+    assert gate.record(0.9) is False        # streak restarted, not resumed
+    assert gate.record(0.9) is True
+
+
+def test_missing_observations_do_not_break_the_streak():
+    """None means 'not seen', which is not evidence that the deck continues.
+
+    The observer reports a drop-off on well under half its frames even where
+    it works (6 of 13 on a measured straight_1), so treating each silent frame
+    as a contradiction would stop the streak ever completing.
+    """
+    gate = DropoffTrigger(trigger_m=1.0, samples=2)
+    assert gate.record(0.9) is False
+    assert gate.record(None) is False
+    assert gate.record(None) is False
+    assert gate.record(0.9) is True
+
+
+def test_implausible_and_negative_readings_are_ignored():
+    """A bad fit must neither fire the trigger nor break a good streak."""
+    gate = DropoffTrigger(trigger_m=1.0, samples=2, max_plausible_m=6.0)
+    assert gate.record(0.9) is False
+    assert gate.record(-0.5) is False       # behind the body
+    assert gate.record(40.0) is False       # nonsense
+    assert gate.record(float('nan')) is False
+    assert gate.record(0.9) is True         # the good streak survived
+
+
+def test_dropoff_trigger_replays_the_measured_straight_1_sequence():
+    """The measured sequence, including the reading that goes the wrong way.
+
+    1.699 1.983 1.511 1.509 1.217 0.990 — at a 1.05 m threshold only the last
+    reading qualifies, so a 2-sample gate must NOT have fired yet.
+    """
+    measured = [1.699, 1.983, 1.511, 1.509, 1.217, 0.990]
+    gate = DropoffTrigger(trigger_m=1.05, samples=2)
+    fired = [gate.record(v) for v in measured]
+    assert not any(fired)
+    assert gate.record(0.95) is True        # second qualifying frame fires it
+
+
+def test_reset_starts_a_fresh_segment():
+    """Each segment gets its own trigger; the latch must clear with it."""
+    gate = DropoffTrigger(trigger_m=1.0, samples=2)
+    gate.record(0.9)
+    gate.record(0.8)
+    assert gate.tripped
+    gate.reset()
+    assert not gate.tripped
+    assert gate.record(0.9) is False
+    assert gate.record(0.8) is True

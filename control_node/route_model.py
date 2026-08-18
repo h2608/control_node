@@ -873,12 +873,28 @@ class StallGate(object):
     ``min_progress_m`` must exceed the estimator's own jitter; odometry drifts
     by a few millimetres while standing, so a strict "no change at all" test
     never fires.
+
+    ``latching`` picks which of the two questions this instance answers.  The
+    default, True, is the fault detector it was written as: it fires once, on
+    the edge, and stays tripped so the caller can act exactly one time.  False
+    makes it a *level* — True on every tick the stall persists, back to False
+    the moment progress resumes — which is what a consumer that has to keep
+    suppressing something for the duration of a stall needs.
+
+    That distinction cost a batch.  Reusing the latching instance to gate the
+    lateral loop's turn term suppressed it for a single tick and then, being
+    tripped, reported False for the rest of the run: the measured symptom was
+    the trim continuing to wind (+0.094 -> +0.111) with odometry progress
+    pinned at 0.00 m, which is precisely the state the suppression exists to
+    prevent.  An edge-triggered signal cannot hold anything down.
     """
 
-    def __init__(self, min_speed=0.0, timeout_s=0.0, min_progress_m=0.05):
+    def __init__(self, min_speed=0.0, timeout_s=0.0, min_progress_m=0.05,
+                 latching=True):
         self.min_speed = float(min_speed)
         self.timeout_s = float(timeout_s)
         self.min_progress_m = float(min_progress_m)
+        self.latching = bool(latching)
         self.reset()
 
     def reset(self):
@@ -894,7 +910,7 @@ class StallGate(object):
 
     def record(self, commanded_speed, progress_m, now_s):
         """Fold in one tick; True the tick the gate trips."""
-        if not self.enabled or self.tripped:
+        if not self.enabled or (self.latching and self.tripped):
             return False
         try:
             speed = abs(float(commanded_speed))
@@ -929,6 +945,88 @@ class StallGate(object):
             'min_progress_m': float(self.min_progress_m),
             'worst_stall_s': float(self.worst_stall_s),
             'tripped': bool(self.tripped),
+        }
+
+
+
+class DropoffTrigger(object):
+    """Fire once when the deck's far edge comes within ``trigger_m`` ahead.
+
+    Every corner on this course is a fixed jump action, so where the robot
+    takes off decides what rotation the jump delivers, and the take-off is
+    currently set by accumulated odometry: ~3 m of integrated leg odometry plus
+    a timed open-loop run.  Measured spread at corner 4 is ~0.33 m against a
+    usable window of ~0.13 m, with the distribution already centred — so no
+    segment length fixes it, because re-centring cannot narrow anything.  A
+    course-referenced trigger can: "the deck ends 1.2 m ahead" does not
+    accumulate error the way "I have walked 2.93 m" does.
+
+    Confirmation is required rather than optional.  The observer is noisy on
+    the ring rails — a measured straight_1 sequence reads 1.699, 1.983, 1.511,
+    1.509, 1.217, 0.990 m, which is a clean downward trend with one reading
+    that goes the wrong way — so a single frame under the threshold is not
+    evidence of arrival.
+
+    Latching, and deliberately so: a segment ends once.  Unlike the lateral
+    suppression gates (see ``StallGate.latching``) there is no "situation
+    improved" state to return to, because the caller has already left.
+    """
+
+    def __init__(self, trigger_m=0.0, samples=2, max_plausible_m=6.0):
+        self.trigger_m = float(trigger_m)
+        self.samples = max(1, int(samples))
+        self.max_plausible_m = float(max_plausible_m)
+        self.reset()
+
+    def reset(self):
+        """Start a fresh segment."""
+        self.streak = 0
+        self.tripped = False
+        self.last_distance_m = None
+
+    @property
+    def enabled(self):
+        return self.trigger_m > 0.0
+
+    def record(self, distance_m):
+        """Fold in one observation; True on the tick the trigger fires.
+
+        ``None`` — no drop-off seen this frame — is *not* evidence that the
+        deck continues, so it leaves the streak alone rather than breaking it.
+        The observer reports a drop-off on well under half of frames even where
+        it works, and treating each silent frame as a contradiction would mean
+        the streak essentially never completes.
+        """
+        if not self.enabled or self.tripped:
+            return False
+        if distance_m is None:
+            return False
+        try:
+            distance = float(distance_m)
+        except (TypeError, ValueError):
+            return False
+        if distance != distance:                                # NaN
+            return False
+        if distance < 0.0 or distance > self.max_plausible_m:
+            # Past the body or implausibly far: a bad fit, not a deck end.
+            return False
+        self.last_distance_m = distance
+        if distance > self.trigger_m:
+            self.streak = 0
+            return False
+        self.streak += 1
+        if self.streak < self.samples:
+            return False
+        self.tripped = True
+        return True
+
+    def snapshot(self):
+        return {
+            'trigger_m': float(self.trigger_m),
+            'samples': int(self.samples),
+            'streak': int(self.streak),
+            'tripped': bool(self.tripped),
+            'last_distance_m': self.last_distance_m,
         }
 
 
