@@ -55,6 +55,7 @@ from control_node.route_model import (
     TIER_DEAD_RECKONING,
     CrossTrackGate,
     StallGate,
+    DropoffTrigger,
     ToppleGate,
     EntryDepthGate,
     RouteModel,
@@ -234,6 +235,8 @@ class Stage5Node(StageNodeBase):
         # fact the gate latches, and a new segment does not undo it.
         self.p5_route_topple_gate.reset()
         self.p5_route_stall_gate.reset()
+        self.p5_deck_lateral_freeze_gate.reset()
+        self.p5_route_dropoff_trigger.reset()
         self.p5_stall_recover_attempts = 0
         self.p5_stall_recover_resume_state = ''
         self.p5_enter_state(self.p5_initial_state)
@@ -456,6 +459,8 @@ class Stage5Node(StageNodeBase):
         self.p5_lateral_depth_suppressed_state = ''
         self.p5_route_odom_valid = False
         self.p5_route_odom_seq = 0
+        self.p5_route_odom_stale_since_s = None
+        self.p5_route_odom_hold = False
         self.p5_route_odom_age_s = None
         self.p5_route_logged_status = ''
         self.p5_route_overrun_handled = False
@@ -470,6 +475,9 @@ class Stage5Node(StageNodeBase):
         self.p5_stall_recover_resume_state = ''
         self.p5_stall_recover_attempts = 0
         self.p5_route_stall_gate = StallGate()
+        self.p5_route_dropoff_trigger = DropoffTrigger()
+        self.p5_route_dropoff_trigger_states = frozenset()
+        self.p5_deck_lateral_freeze_gate = StallGate(latching=False)
         self.p5_fall_recover_phase = ''
         self.p5_fall_recover_since_monotonic_s = None
         self.p5_fall_recover_retry_state = ''
@@ -1169,6 +1177,7 @@ class Stage5Node(StageNodeBase):
         # 双边提取器在那里永远拿不到证据。宽度是已声明的赛道属性。
         self.declare_parameter('p5_bridge_single_sided_edges_enabled', False)
         self.declare_parameter('p5_bridge_declared_deck_width', 0.0)
+        self.declare_parameter('p5_bridge_dropoff_body_axis_fallback', False)
         # 段进度用路径长度还是沿路线投影（path / along_track）。
         self.declare_parameter('p5_route_progress_measure', 'path')
         # 入段深度完整性门：爬坡段结束时深度观测器的有效帧数必须达标，
@@ -1198,6 +1207,12 @@ class Stage5Node(StageNodeBase):
         self.declare_parameter('p5_route_stall_timeout_s', 0.0)
         self.declare_parameter('p5_route_stall_min_progress_m', 0.05)
         self.declare_parameter('p5_route_stall_max_attempts', 1)
+        self.declare_parameter('p5_deck_lateral_stall_freeze_s', 0.0)
+        self.declare_parameter('p5_deck_lateral_stall_vy_scale', 1.0)
+        self.declare_parameter('p5_deck_lateral_wz_futile_samples', 0)
+        self.declare_parameter('p5_route_dropoff_trigger_m', 0.0)
+        self.declare_parameter('p5_route_dropoff_trigger_samples', 2)
+        self.declare_parameter('p5_route_dropoff_trigger_states', '')
         self.declare_parameter('p5_route_topple_limit_rad', 0.0)
         self.declare_parameter('p5_route_topple_samples', 25)
 
@@ -1216,6 +1231,7 @@ class Stage5Node(StageNodeBase):
         self.declare_parameter('p5_route_overrun_action', 'fault')
         self.declare_parameter('p5_route_odometry_required', True)
         self.declare_parameter('p5_route_odom_max_age_s', 0.50)
+        self.declare_parameter('p5_route_odom_stale_grace_s', 0.0)
         # 50 Hz 下正常步进约 1 cm；超过这个单步位移视为估计器跳变/跳跃不计入里程。
         self.declare_parameter('p5_route_odom_max_step_m', 0.20)
         self.declare_parameter('p5_route_speed_cap_enabled', True)
@@ -1830,6 +1846,10 @@ class Stage5Node(StageNodeBase):
                 gp('p5_deck_lateral_centre_first_vx_scale').value))),
             k_i_vy=max(0.0, float(gp('p5_deck_lateral_k_i_vy').value)),
             max_i_vy=max(0.0, float(gp('p5_deck_lateral_max_i_vy').value)),
+            stall_vy_scale=min(1.0, max(0.0, float(
+                gp('p5_deck_lateral_stall_vy_scale').value))),
+            wz_futile_samples=max(
+                0, int(gp('p5_deck_lateral_wz_futile_samples').value)),
         ))
         self.p5_route_lateral_fallback = bool(
             gp('p5_route_lateral_fallback').value)
@@ -1859,6 +1879,8 @@ class Stage5Node(StageNodeBase):
             gp('p5_bridge_single_sided_edges_enabled').value)
         self.p5_bridge_config.declared_deck_width = max(
             0.0, float(gp('p5_bridge_declared_deck_width').value))
+        self.p5_bridge_config.dropoff_body_axis_fallback = bool(
+            gp('p5_bridge_dropoff_body_axis_fallback').value)
         self.p5_route_progress_measure = str(
             gp('p5_route_progress_measure').value)
         if self.p5_route_progress_measure not in ('path', 'along_track'):
@@ -1893,6 +1915,24 @@ class Stage5Node(StageNodeBase):
                 float(gp('p5_route_stall_min_progress_m').value)))
         self.p5_route_stall_max_attempts = max(
             0, int(gp('p5_route_stall_max_attempts').value))
+        # A second, much shorter gate on the same signal.  The recovery gate
+        # asks "has this segment died?" and answers in seconds; this one asks
+        # "is the turn term buying anything right now?" and has to answer
+        # before the body is twisted off the deck.  0.0 disables it.
+        self.p5_route_dropoff_trigger = DropoffTrigger(
+            trigger_m=max(0.0, float(gp('p5_route_dropoff_trigger_m').value)),
+            samples=max(1, int(gp('p5_route_dropoff_trigger_samples').value)))
+        self.p5_route_dropoff_trigger_states = frozenset(
+            name.strip()
+            for name in str(gp('p5_route_dropoff_trigger_states').value).split(',')
+            if name.strip())
+        self.p5_deck_lateral_freeze_gate = StallGate(
+            min_speed=abs(float(gp('p5_route_stall_min_speed').value)),
+            timeout_s=max(0.0, float(
+                gp('p5_deck_lateral_stall_freeze_s').value)),
+            min_progress_m=abs(
+                float(gp('p5_route_stall_min_progress_m').value)),
+            latching=False)
         self.p5_deck_lateral_engage_after_m = max(
             0.0, float(gp('p5_deck_lateral_engage_after_m').value))
         self.p5_deck_lateral_centre_first_states = frozenset(
@@ -1921,6 +1961,8 @@ class Stage5Node(StageNodeBase):
         self.p5_route_overrun_action = str(gp('p5_route_overrun_action').value)
         self.p5_route_odometry_required = bool(gp('p5_route_odometry_required').value)
         self.p5_route_odom_max_age_s = max(0.0, float(gp('p5_route_odom_max_age_s').value))
+        self.p5_route_odom_stale_grace_s = max(
+            0.0, float(gp('p5_route_odom_stale_grace_s').value))
         self.p5_route_odom_max_step_m = max(1e-3, float(gp('p5_route_odom_max_step_m').value))
         self.p5_route_speed_cap_enabled = bool(gp('p5_route_speed_cap_enabled').value)
         self.p5_route_turn_verify_enabled = bool(gp('p5_route_turn_verify_enabled').value)
@@ -2210,6 +2252,35 @@ class Stage5Node(StageNodeBase):
     def p5_route_active(self) -> bool:
         return bool(self.p5_route_model_enabled and self.p5_route_model is not None)
 
+    def p5_route_odom_coasting(self) -> bool:
+        """True while a stale odometry stream is still inside its grace window.
+
+        Failing closed on missing odometry is right — a frozen estimate reads
+        as "no motion" and would hold every gate shut in silence.  Failing
+        closed on the *first* late sample is not: the stream is 50 Hz, and a
+        scheduling hiccup that delivers nothing for half a second says the
+        machine stuttered, not that the robot is lost.
+
+        Measured over one batch of sixteen: seven runs faulted here, ages
+        0.515, 0.520, 0.767, 0.781, 0.814, 0.826, 0.842, 0.857 s against a
+        0.5 s limit — every one of them under a second, and the two marginal
+        ones killed runs that were walking straight down the rail (offset
+        -0.009 m on the tick before the fault).  The same batch's predecessor
+        faulted here zero times, so what moved was the host, not the robot.
+
+        While coasting the caller stops the body rather than stepping blind, so
+        the grace buys a pause, not dead reckoning; if the stream does not come
+        back inside it the original fault fires unchanged.
+        """
+        if self.p5_route_odom_stale_grace_s <= 0.0:
+            return False
+        now = time.monotonic()
+        if self.p5_route_odom_stale_since_s is None:
+            self.p5_route_odom_stale_since_s = now
+            return True
+        return (now - self.p5_route_odom_stale_since_s
+                <= self.p5_route_odom_stale_grace_s)
+
     def p5_route_enforcing(self, segment) -> bool:
         """True when this segment's transitions must satisfy both sources."""
         return bool(
@@ -2227,6 +2298,11 @@ class Stage5Node(StageNodeBase):
         progress at zero and hold every gate closed silently.
         """
         self.p5_route_odom_valid = False
+        # Recomputed every tick, not latched: cleared here and set only by the
+        # gate below.  Clearing it solely on the "odometry is valid" path left
+        # it stuck true whenever this function returned early (route inactive,
+        # or no Odom link), which would hold the body still indefinitely.
+        self.p5_route_odom_hold = False
         self.p5_route_odom_age_s = None
         if not self.p5_route_active() or self.Odom is None:
             return
@@ -2240,6 +2316,7 @@ class Stage5Node(StageNodeBase):
         if age > self.p5_route_odom_max_age_s:
             return
         self.p5_route_odom_valid = True
+        self.p5_route_odom_stale_since_s = None
         progress.update(
             seq=snapshot['seq'],
             x=snapshot['p'][0],
@@ -2318,6 +2395,7 @@ class Stage5Node(StageNodeBase):
                 enforcing
                 and self.p5_route_odometry_required
                 and self.p5_safety_elapsed_s() >= self.p5_sensor_fault_grace_s
+                and not self.p5_route_odom_coasting()
             ):
                 self.p5_route_fault(
                     'P5_ROUTE', 'route_odometry_fault', {
@@ -2327,6 +2405,9 @@ class Stage5Node(StageNodeBase):
                         'max_age_s': float(self.p5_route_odom_max_age_s),
                     })
                 return True
+            # Coast means *stop*, not step blind: the body holds still until
+            # the stream comes back or the grace runs out.
+            self.p5_route_odom_hold = True
             self.p5_route_log_status(segment, GATE_UNAVAILABLE)
             return False
 
@@ -2618,11 +2699,29 @@ class Stage5Node(StageNodeBase):
             })
         return None
 
-    def p5_deck_lateral_update(self, name: str):
+    def p5_latest_dropoff_distance(self):
+        """Return the freshest forward drop-off distance, or None.
+
+        Read independently of the observation's ``valid`` flag on purpose:
+        that flag reports whether the two-sided *edge* fit succeeded, which is
+        a different question from whether the deck's far edge was seen.  On the
+        ring rails the edge fit is exactly what fails, so gating the drop-off
+        on it would discard the measurement in the one place it is wanted.
+        """
+        observation = self.latest_bridge_observation
+        if not observation:
+            return None
+        return observation.get('d_forward_dropoff')
+
+    def p5_deck_lateral_update(self, name: str, forward_stalled: bool = False):
         """Fold the best available lateral observation into a vy/wz correction.
 
         Returns ``(vy, wz, vx_scale)``.  When the loop is disabled this is a
         no-op, so the odometry-only behaviour is bit-for-bit unchanged.
+
+        ``forward_stalled`` is passed straight through to the controller, which
+        drops its turn term while it holds — see ``DeckLateralController.update``
+        for the measurement behind that.
         """
         if not self.p5_deck_lateral_enabled:
             return 0.0, 0.0, 1.0
@@ -2652,7 +2751,8 @@ class Stage5Node(StageNodeBase):
                 'source': source,
             })
 
-        command = self.p5_deck_lateral.update(observation, time.monotonic())
+        command = self.p5_deck_lateral.update(
+            observation, time.monotonic(), forward_stalled=forward_stalled)
         previous = self.p5_deck_lateral_last
         self.p5_deck_lateral_last = command.state
 
@@ -2701,6 +2801,10 @@ class Stage5Node(StageNodeBase):
             f'{"n/a" if command.heading_error is None else f"{command.heading_error:+.3f}"}'
             f' i={command.vy_integral:+.3f}'
             f' anchor={self.p5_route_lateral_anchor_m:+.3f}'
+            # Printed because the first version of the freeze was unobservable:
+            # it silently did nothing for a whole batch, and the only way to
+            # tell was to re-derive it from progress deltas after the fact.
+            f'{" FRZ" if forward_stalled else ""}'
             f' {command.state}/{command.reason}')
         return command.vy, command.wz, command.vx_scale
 
@@ -2741,6 +2845,47 @@ class Stage5Node(StageNodeBase):
             odometry_valid=self.p5_route_odom_valid,
         )
 
+        if self.p5_route_odom_hold:
+            # Placed ahead of every branch below, because all of them read a
+            # decision derived from odometry: the exit test, the unavailable
+            # fault, the lateral loop and the stall gate alike.  A transient
+            # dropout holds the body still and lets the next tick decide.
+            # It must also precede the GATE_UNAVAILABLE fault, which is the
+            # *same* dropout arriving by a different name — measured: a run
+            # walking cleanly at 1.26/2.93 m with offset +0.018 died of
+            # `route_odometry_exit_unavailable` while the grace was in force
+            # but only wired into the entry-gate path.
+            self.p5_send_velocity_command(
+                vx=0.0, vy=0.0, wz=0.0, step_height=step_height,
+                roll=roll, pitch=pitch, body_height=body_height)
+            return
+
+        # Course-referenced exit, tried before the odometry one.  Odometry is
+        # not replaced by it: the segment's `[min, max]` window still bounds
+        # the run, so a trigger that fires far too early is caught by the same
+        # window check that has always been there, and one that never fires
+        # leaves the odometry exit exactly as it was.  This is strictly an
+        # *earlier* opportunity to end the segment on evidence that does not
+        # accumulate, not a new sole authority.
+        if (self.p5_route_dropoff_trigger.enabled
+                and name in self.p5_route_dropoff_trigger_states
+                and self.p5_route_dropoff_trigger.record(
+                    self.p5_latest_dropoff_distance())):
+            detail = {'event': 'route_exit_dropoff',
+                      'state': str(self.state),
+                      'segment': segment.name,
+                      'progress_m': float(decision.progress_m),
+                      'expected_m': float(segment.expected_m)}
+            detail.update(self.p5_route_dropoff_trigger.snapshot())
+            self.get_logger().info(
+                f'[{name}] deck end seen '
+                f'{self.p5_route_dropoff_trigger.last_distance_m:.2f} m ahead '
+                f'at {decision.progress_m:.2f}/{segment.expected_m:.2f} m, '
+                f'go {next_state}')
+            self.p5_evidence_log(detail)
+            self.p5_enter_state(next_state)
+            return
+
         if decision.allow_exit:
             self.get_logger().info(
                 f'[{name}] odometry length reached: '
@@ -2772,7 +2917,13 @@ class Stage5Node(StageNodeBase):
 
         # Odometry gives progress along the route; it never gives offset from
         # the deck centreline.  This is the only loop that closes that.
-        deck_vy, deck_wz, vx_scale = self.p5_deck_lateral_update(name)
+        # The freeze gate is recorded before the lateral update, not after,
+        # because it has to reach the controller on the same tick the stall is
+        # detected: the measured runaway doubles the heading error in three.
+        stalled = self.p5_deck_lateral_freeze_gate.record(
+            vx, decision.progress_m, time.monotonic())
+        deck_vy, deck_wz, vx_scale = self.p5_deck_lateral_update(
+            name, forward_stalled=stalled)
         vx = vx * vx_scale
         vy = vy + deck_vy
         wz = wz + deck_wz
@@ -2998,6 +3149,8 @@ class Stage5Node(StageNodeBase):
         # 新段 = 新入口基准线，横向偏离预算跟着重置。
         self.p5_route_cross_track_gate.reset()
         self.p5_route_stall_gate.reset()
+        self.p5_deck_lateral_freeze_gate.reset()
+        self.p5_route_dropoff_trigger.reset()
         # The re-alignment budget is per corner, not per stage run: one corner
         # spending it must not silently turn the next corner's first miss into
         # an immediate fault.
