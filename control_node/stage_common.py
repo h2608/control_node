@@ -18,7 +18,7 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.time import Time
 from sensor_msgs.msg import Image
-from std_msgs.msg import Int32
+from std_msgs.msg import Int32, String
 from rclpy.qos import (
     qos_profile_sensor_data,
     QoSProfile,
@@ -38,12 +38,31 @@ except ImportError:
     YamlParam = None
     ApplyForce = None
 
+from control_node.ingest_policy import (
+    RAW_MODE_AUTO,
+    RAW_MODE_OFF,
+    raw_stream_wanted,
+    resolve_image_qos_depth,
+    resolve_raw_subscription_mode,
+    resolve_resubscribe_after_s,
+)
 from control_node.robot_control_cmd_lcmt import robot_control_cmd_lcmt
 from control_node.robot_interface import create_robot_controller
+from control_node.rx_diagnostics import RxDiagnostics
 from control_node.stage_entry import (
     SOURCE_DEFAULT,
     is_default_request,
 )
+
+
+def image_qos(depth: int) -> QoSProfile:
+    """Sensor-data QoS (BEST_EFFORT/VOLATILE) with an explicit history depth."""
+    return QoSProfile(
+        depth=max(1, int(depth)),
+        history=HistoryPolicy.KEEP_LAST,
+        reliability=qos_profile_sensor_data.reliability,
+        durability=qos_profile_sensor_data.durability,
+    )
 
 
 def mission_latched_qos(depth: int = 1) -> QoSProfile:
@@ -163,6 +182,33 @@ class StageNodeBase(Node):
         self.declare_parameter('mission_complete_topic', '/mission/stage_complete')
         self.declare_parameter('mission_inactive_topic', '/mission/stage_inactive')
 
+        # =========================
+        # 原始图像订阅策略与诊断（真机 RGB 掉流排查用）
+        # =========================
+        # 这些开关只影响"本节点向 DDS 要多少原始图像"和"打印多少诊断"，
+        # 不改变任何赛段状态机逻辑，也不放宽任何视觉超时保护。
+        self.declare_parameter('raw_rgb_subscription', RAW_MODE_AUTO)
+        self.declare_parameter('raw_depth_subscription', RAW_MODE_AUTO)
+        self.declare_parameter('image_qos_depth', 0)
+        # Self-heal for a wedged reader.  Stage 4 already proved on hardware
+        # that a raw RGB subscription can stop delivering while the publisher
+        # keeps running and that rebuilding just the endpoint recovers it; this
+        # generalises that recovery to every stage.  <0 = auto (on for the
+        # physical robot, off in simulation), 0 = off.
+        self.declare_parameter('raw_resubscribe_after_sec', -1.0)
+        self.declare_parameter('raw_resubscribe_cooldown_sec', 5.0)
+        self.declare_parameter('tf_listener_enabled', True)
+        # Diagnostic bisect switch: activate the stage state machine without
+        # ever creating the motion backend (no real_motion_api helper node, no
+        # helper executor thread, no Servo traffic).  Never enable-by-omission:
+        # this makes the robot stand still, which is safe, but it must be loud.
+        self.declare_parameter('stage_backend_enabled', True)
+        self.declare_parameter('diagnostics_enabled', True)
+        self.declare_parameter('diag_report_period_sec', 2.0)
+        self.declare_parameter('diag_stall_warn_sec', 2.0)
+        self.declare_parameter('diag_event_topic_enabled', True)
+        self.declare_parameter('diag_event_topic', '/mission/diag/event')
+
         # 调试入口：跳过赛段前面的流程，直接从某一段开始（例如第五赛段的
         # ``ramp`` = 上坡段）。取 default/空 时走赛段正常起点。每个赛段用
         # StageEntryTable 声明自己的入口名，见 stage_entry.py。
@@ -183,6 +229,14 @@ class StageNodeBase(Node):
         self.declare_parameter('real_servo_start_ack_timeout_s', 2.0)
         self.declare_parameter('real_motion_service_wait_timeout_s', 2.0)
         self.declare_parameter('real_action_wait_timeout_s', 45.0)
+        # Diagnostic bisect switches for the physical motion path.  Both are
+        # True in every normal configuration.  Setting one to False keeps the
+        # helper node/executor and the state machine exactly as they are but
+        # removes one class of outgoing traffic, so the RGB-dropout trigger can
+        # be narrowed on the robot without editing source.  Either one makes
+        # the robot stand still, which is safe, and both log at WARN.
+        self.declare_parameter('real_servo_publish_enabled', True)
+        self.declare_parameter('real_result_actions_enabled', True)
         self.declare_parameter('real_recovery_motion_id', 111)
         self.declare_parameter('real_emergency_stop_motion_id', 0)
         self.declare_parameter('real_lie_down_motion_id', 101)
@@ -216,6 +270,31 @@ class StageNodeBase(Node):
         self.entry_table = None
         self.entry_resolution = None
 
+        self.raw_rgb_mode = resolve_raw_subscription_mode(
+            self.get_parameter('raw_rgb_subscription').value, self.platform)
+        self.raw_depth_mode = resolve_raw_subscription_mode(
+            self.get_parameter('raw_depth_subscription').value, self.platform)
+        self.image_qos_depth = resolve_image_qos_depth(
+            self.get_parameter('image_qos_depth').value, self.platform,
+            sim_default=qos_profile_sensor_data.depth)
+        self.raw_resubscribe_after_s = resolve_resubscribe_after_s(
+            self.get_parameter('raw_resubscribe_after_sec').value, self.platform)
+        self.raw_resubscribe_cooldown_s = max(
+            0.5, float(self.get_parameter('raw_resubscribe_cooldown_sec').value))
+        self.tf_listener_enabled = bool(
+            self.get_parameter('tf_listener_enabled').value)
+        self.stage_backend_enabled = bool(
+            self.get_parameter('stage_backend_enabled').value)
+        self.diagnostics_enabled = bool(
+            self.get_parameter('diagnostics_enabled').value)
+        self.diag_report_period_sec = max(
+            0.0, float(self.get_parameter('diag_report_period_sec').value))
+        self.diag_stall_warn_sec = max(
+            0.0, float(self.get_parameter('diag_stall_warn_sec').value))
+        self.diag_event_topic_enabled = bool(
+            self.get_parameter('diag_event_topic_enabled').value)
+        self.diag_event_topic = str(self.get_parameter('diag_event_topic').value)
+
         # =========================
         # 控制接口：adapter 延迟到激活时创建。self.Ctrl 暂时保留这个名字，
         # 让尚未清理的 Stage4/5/6 旧调用通过兼容层继续工作。
@@ -243,9 +322,17 @@ class StageNodeBase(Node):
         self.last_depth_rx_time_s: Optional[float] = None
 
         # TF 只作为可选调试/兼容信息使用。主状态机不因为 TF 不可用而停止。
+        # tf_listener_enabled=False 时不订阅 /tf、/tf_static，get_current_pose()
+        # 一律返回 None —— 这是排查 DDS 负载时用的隔离开关，不是常规配置。
         self.last_known_pose: Optional[Tuple[float, float, float]] = None
         self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.tf_listener = None
+        if self.tf_listener_enabled:
+            self.tf_listener = TransformListener(self.tf_buffer, self)
+        else:
+            self.get_logger().warn(
+                '[DIAG_MODE] tf_listener_enabled=False: /tf and /tf_static are '
+                'not subscribed and get_current_pose() always returns None')
 
         self.rgb_w = 640
         self.rgb_h = 480
@@ -282,10 +369,34 @@ class StageNodeBase(Node):
         self.stage_inactive_pub = self.create_publisher(
             Int32, self.mission_inactive_topic, mission_signal_qos(10))
 
-        self.rgb_sub = self.create_subscription(
-            Image, self.rgb_topic, self.rgb_callback, qos_profile_sensor_data)
-        self.depth_sub = self.create_subscription(
-            Image, self.depth_topic, self.depth_callback, qos_profile_sensor_data)
+        # =========================
+        # 接收诊断
+        # =========================
+        self.rx_diag = RxDiagnostics(
+            node_name,
+            streams=('rgb', 'depth'),
+            stall_warn_s=self.diag_stall_warn_sec,
+            report_period_s=self.diag_report_period_sec,
+        )
+        self.diag_event_pub = None
+        if self.diagnostics_enabled and self.diag_event_topic_enabled:
+            self.diag_event_pub = self.create_publisher(
+                String, self.diag_event_topic, mission_signal_qos(20))
+        self.diag_timer = None
+        if self.diagnostics_enabled and self.diag_report_period_sec > 0.0:
+            self.diag_timer = self.create_timer(
+                self.diag_report_period_sec, self._diag_timer_cb)
+
+        self._last_mission_stage = None
+        self.rgb_sub = None
+        self.depth_sub = None
+        self._raw_resubscribe_counts = {'rgb': 0, 'depth': 0}
+        self._raw_last_resubscribe_s = {'rgb': 0.0, 'depth': 0.0}
+        self._apply_raw_subscriptions(activated=False, reason='node_init')
+
+        self.raw_watchdog_timer = None
+        if self.raw_resubscribe_after_s > 0.0:
+            self.raw_watchdog_timer = self.create_timer(1.0, self._raw_watchdog_cb)
 
         self.control_timer = self.create_timer(1.0 / self.control_hz, self._control_timer_cb)
 
@@ -298,12 +409,238 @@ class StageNodeBase(Node):
                 f'ai_camera_topic={self.ai_camera_topic} (reserved, not subscribed)')
         self.get_logger().info(f'tf: {self.global_frame} -> {self.base_frame}')
         self.get_logger().info(f'platform={self.platform}, use_sim_time={self.get_parameter("use_sim_time").value}')
+        self.get_logger().warn(
+            f'[RXCFG] raw_rgb_subscription={self.raw_rgb_mode}, '
+            f'raw_depth_subscription={self.raw_depth_mode}, '
+            f'image_qos_depth={self.image_qos_depth}, '
+            f'tf_listener={self.tf_listener_enabled}, '
+            f'stage_backend_enabled={self.stage_backend_enabled}, '
+            f'control_hz={self.control_hz:.1f}')
+        if not self.stage_backend_enabled:
+            self.get_logger().warn(
+                '[DIAG_MODE] stage_backend_enabled=False: this stage will run '
+                'its state machine but will NEVER create a motion backend and '
+                'the robot will NOT move')
+        self.note_stage_event('NODE_INIT_DONE')
+
+    # ============================================================
+    # 原始图像订阅生命周期
+    # ============================================================
+    def _start_raw_rgb(self) -> None:
+        if self.rgb_sub is not None:
+            return
+        self.rgb_sub = self.create_subscription(
+            Image, self.rgb_topic, self.rgb_callback,
+            image_qos(self.image_qos_depth))
+
+    def _stop_raw_rgb(self) -> None:
+        if self.rgb_sub is None:
+            return
+        try:
+            self.destroy_subscription(self.rgb_sub)
+        except Exception as exc:
+            self.get_logger().warn(f'[RXCFG] destroy rgb subscription failed: {exc}')
+        self.rgb_sub = None
+
+    def _start_raw_depth(self) -> None:
+        if self.depth_sub is not None:
+            return
+        self.depth_sub = self.create_subscription(
+            Image, self.depth_topic, self.depth_callback,
+            image_qos(self.image_qos_depth))
+
+    def _stop_raw_depth(self) -> None:
+        if self.depth_sub is None:
+            return
+        try:
+            self.destroy_subscription(self.depth_sub)
+        except Exception as exc:
+            self.get_logger().warn(f'[RXCFG] destroy depth subscription failed: {exc}')
+        self.depth_sub = None
+
+    def disable_raw_image_ingestion(self, reason: str = '') -> None:
+        """Permanently opt this node out of raw RGB/depth ingestion.
+
+        For a stage that consumes pre-computed perception results instead of
+        images (the physical Stage 2 receives Float32MultiArray detections from
+        the PC), destroying the inherited subscriptions in ``__init__`` is not
+        enough on its own: activation would recreate them.  Call this instead --
+        it also switches the policy off, so no later transition brings the
+        readers back.
+        """
+        self.raw_rgb_mode = RAW_MODE_OFF
+        self.raw_depth_mode = RAW_MODE_OFF
+        self._apply_raw_subscriptions(
+            activated=self.active, reason='disabled:{}'.format(reason or '-'))
+        self.get_logger().warn(
+            '[RXCFG] raw RGB/depth ingestion permanently disabled on this node'
+            + (': ' + reason if reason else ''))
+
+    def on_apply_extra_raw_subscriptions(self, want_rgb: bool,
+                                         want_depth: bool) -> None:
+        """Hook for stages that own raw camera readers outside the base class.
+
+        Stage 4 receives RGB on a dedicated helper node/executor rather than on
+        ``self.rgb_sub``, and Stage 2 owns the fisheye pair; overriding this
+        keeps those readers under the same ingestion policy.  It is called on
+        every lifecycle transition, so implementations must be idempotent.
+        """
+
+    def _apply_raw_subscriptions(self, activated: bool, reason: str = '') -> None:
+        """Create/destroy raw image readers for the current lifecycle phase."""
+        want_rgb = raw_stream_wanted(self.raw_rgb_mode, activated)
+        want_depth = raw_stream_wanted(self.raw_depth_mode, activated)
+        had_rgb = self.rgb_sub is not None
+        had_depth = self.depth_sub is not None
+
+        if want_rgb:
+            self._start_raw_rgb()
+        else:
+            self._stop_raw_rgb()
+        if want_depth:
+            self._start_raw_depth()
+        else:
+            self._stop_raw_depth()
+
+        self.on_apply_extra_raw_subscriptions(want_rgb, want_depth)
+
+        if had_rgb != want_rgb or had_depth != want_depth or reason == 'node_init':
+            self.note_stage_event(
+                'RAW_SUBS',
+                'reason={} rgb={} depth={} qos_depth={}'.format(
+                    reason or '-', want_rgb, want_depth, self.image_qos_depth))
+
+    def _raw_watchdog_cb(self) -> None:
+        """Rebuild a raw image reader that has stopped delivering.
+
+        This is recovery, not a safety relaxation: the stage's own vision-stale
+        guard keeps stopping the robot for exactly as long as the stream is
+        stale, and nothing here marks a frame as fresh.  It only tries to get
+        delivery back, on the evidence that destroying and recreating the
+        endpoint is what fixed the same symptom in Stage 4 on hardware.
+        """
+        threshold = self.raw_resubscribe_after_s
+        if threshold <= 0.0:
+            return
+        now = time.monotonic()
+        for name, restart in (('rgb', self._restart_raw_rgb),
+                              ('depth', self._restart_raw_depth)):
+            stream = self.rx_diag.streams.get(name)
+            if stream is None or stream.last_rx_s is None:
+                # Never delivered anything: there is no working state to
+                # restore, and a topic that is simply absent must not turn into
+                # an endless rebuild loop.
+                continue
+            if name == 'rgb' and self.rgb_sub is None:
+                continue
+            if name == 'depth' and self.depth_sub is None:
+                continue
+            if now - stream.last_rx_s < threshold:
+                continue
+            if now - self._raw_last_resubscribe_s[name] < self.raw_resubscribe_cooldown_s:
+                continue
+            self._raw_last_resubscribe_s[name] = now
+            self._raw_resubscribe_counts[name] += 1
+            silent_s = now - stream.last_rx_s
+            self.get_logger().error(
+                f'[RXHEAL] node={self.get_name()} stream={name} silent for '
+                f'{silent_s:.2f}s; rebuilding the subscription '
+                f'(attempt {self._raw_resubscribe_counts[name]})')
+            try:
+                restart()
+            except Exception as exc:
+                self.get_logger().error(
+                    f'[RXHEAL] stream={name} rebuild failed: {exc}')
+                continue
+            self.note_stage_event(
+                'RAW_RESUBSCRIBE',
+                'stream={} silent_s={:.2f} attempt={}'.format(
+                    name, silent_s, self._raw_resubscribe_counts[name]))
+
+    def _restart_raw_rgb(self) -> None:
+        self._stop_raw_rgb()
+        self._start_raw_rgb()
+
+    def _restart_raw_depth(self) -> None:
+        self._stop_raw_depth()
+        self._start_raw_depth()
+
+    # ============================================================
+    # 诊断
+    # ============================================================
+    def note_stage_event(self, event: str, detail: str = '') -> None:
+        """Emit one lifecycle marker to the log and the shared diag topic.
+
+        The whole point is cross-process correlation: the C++ bridge's frozen
+        ``RX raw RGB=`` counter has to be attributable to one transition, and a
+        single ``ros2 topic echo /mission/diag/event`` collects the markers of
+        all seven control processes in one ordered stream.
+        """
+        diag = getattr(self, 'rx_diag', None)
+        if diag is None:
+            return
+        line = diag.note_event(event, detail)
+        self.get_logger().warn(line)
+        pub = getattr(self, 'diag_event_pub', None)
+        if pub is not None:
+            out = String()
+            out.data = line
+            try:
+                pub.publish(out)
+            except Exception:
+                pass
+
+    def diag_extra_fields(self) -> str:
+        """Extra key=value text appended to the periodic [RXDIAG] line."""
+        ctrl = getattr(self, 'Ctrl', None)
+        parts = [
+            'state={}'.format(self.state),
+            'active={}'.format(self.active),
+            'finished={}'.format(self.finished),
+            'backend={}'.format(
+                'none' if ctrl is None else getattr(ctrl, 'backend_name', '?')),
+            'resub=rgb{}/depth{}'.format(
+                self._raw_resubscribe_counts['rgb'],
+                self._raw_resubscribe_counts['depth']),
+        ]
+        if ctrl is not None:
+            snapshot = getattr(ctrl, 'diagnostics_snapshot', None)
+            if callable(snapshot):
+                try:
+                    for key, value in sorted(snapshot().items()):
+                        parts.append('{}={}'.format(key, value))
+                except Exception:
+                    pass
+        return ' '.join(parts)
+
+    def _diag_timer_cb(self) -> None:
+        diag = self.rx_diag
+        for stream, kind, silent_s in diag.poll_stalls():
+            if kind == 'stall':
+                self.get_logger().error(
+                    f'[RXSTALL] node={self.get_name()} stream={stream} '
+                    f'silent_for={silent_s:.2f}s state={self.state} '
+                    f'active={self.active}')
+            else:
+                self.get_logger().warn(
+                    f'[RXSTALL] node={self.get_name()} stream={stream} '
+                    f'RECOVERED after {silent_s:.2f}s')
+        line = diag.due_report()
+        if line is not None:
+            self.get_logger().info(line + ' | ' + self.diag_extra_fields())
 
     # ============================================================
     # 任务控制：激活 / 停用 / 完成
     # ============================================================
     def _mission_cb(self, msg: Int32):
         stage = int(msg.data)
+        # Mission control republishes the same value every period; only the
+        # transitions belong in the event stream.  A 1 Hz marker per stage node
+        # would be exactly the kind of avoidable logging this investigation is
+        # trying to rule out.
+        if stage != self._last_mission_stage:
+            self._last_mission_stage = stage
+            self.note_stage_event('MISSION_MSG', 'active_stage={}'.format(stage))
         if stage == 0:
             self.activation_armed = True
             if self.active:
@@ -329,20 +666,31 @@ class StageNodeBase(Node):
 
     def _activate(self):
         self.get_logger().info(f'[MISSION] stage {self.stage_id} activated')
+        self.note_stage_event('ACTIVATE_BEGIN')
+        # Start raw ingestion before the backend: the first move() on the
+        # physical backend blocks this executor until the robot ACKs Servo
+        # START, and the reader should already be matched by then.
+        self._apply_raw_subscriptions(activated=True, reason='activate')
+        self.note_stage_event('BACKEND_CREATE_BEGIN')
         self.start_ctrl()
+        self.note_stage_event('BACKEND_CREATE_DONE')
         self.active = True
         try:
             self.on_activated()
         except Exception:
             self.active = False
             self.stop_ctrl()
+            self._apply_raw_subscriptions(activated=False, reason='activate_failed')
             raise
+        self.note_stage_event('ACTIVATE_DONE')
 
     def _deactivate(self, reason: str = '', publish_ack: bool = False):
         # 任务控制切走本赛段（人工跳段/中止）：停心跳，让接管的赛段独占命令通道。
         self.get_logger().warn(f'[MISSION] stage {self.stage_id} deactivated ({reason})')
         self.active = False
         self.stop_ctrl()
+        self._apply_raw_subscriptions(activated=False, reason='deactivate')
+        self.note_stage_event('DEACTIVATE', 'reason={}'.format(reason))
         if publish_ack:
             self._publish_inactive_ack()
 
@@ -356,6 +704,12 @@ class StageNodeBase(Node):
             throttle_duration_sec=1.0)
 
     def start_ctrl(self):
+        if not self.stage_backend_enabled:
+            self.get_logger().warn(
+                '[DIAG_MODE] stage_backend_enabled=False: motion backend NOT '
+                'created; every robot command from this stage is a no-op',
+                throttle_duration_sec=5.0)
+            return
         if self.Ctrl is None:
             self.Ctrl = create_robot_controller(self)
             self.robot = self.Ctrl
@@ -382,6 +736,8 @@ class StageNodeBase(Node):
         self.get_logger().info(f'[MISSION] stage {self.stage_id} complete{suffix}')
         # 先停心跳线程，再发布完成消息：避免本赛段残留命令和下一赛段抢通道。
         self.stop_ctrl()
+        self._apply_raw_subscriptions(activated=False, reason='complete')
+        self.note_stage_event('COMPLETE', 'reason={}'.format(reason))
         out = Int32()
         out.data = self.stage_id
         self.stage_complete_pub.publish(out)
@@ -442,6 +798,10 @@ class StageNodeBase(Node):
     # 图像回调：未激活时只缓存原始消息，不做 cv_bridge 转换
     # ============================================================
     def rgb_callback(self, msg: Image):
+        # Count every *delivered* message, not only successfully decoded ones:
+        # this counter is the node-side twin of the bridge's ``RX raw RGB=`` and
+        # has to answer "did DDS stop delivering", not "did cv_bridge succeed".
+        self.rx_diag.record('rgb')
         self.latest_rgb_msg = msg
         if not self.active or self.finished:
             return
@@ -471,6 +831,7 @@ class StageNodeBase(Node):
         pass
 
     def depth_callback(self, msg: Image):
+        self.rx_diag.record('depth')
         if not self.active or self.finished:
             self.latest_depth_msg = msg
             return
@@ -693,6 +1054,8 @@ class StageNodeBase(Node):
     # TF
     # ============================================================
     def get_current_pose(self) -> Optional[Tuple[float, float, float]]:
+        if self.tf_listener is None:
+            return None
         try:
             tf_msg = self.tf_buffer.lookup_transform(self.global_frame, self.base_frame, Time())
         except (LookupException, ConnectivityException, ExtrapolationException):
